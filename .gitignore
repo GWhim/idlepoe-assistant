@@ -1,0 +1,10 @@
+# Local version snapshots from upstream/manual migration.
+测试服助手2.*.txt
+测试服助手2.*.js
+
+# Keep the stable Greasy Fork sync entry tracked.
+!idlepoe-assistant.user.js
+
+# Local/editor noise.
+.DS_Store
+Thumbs.db
