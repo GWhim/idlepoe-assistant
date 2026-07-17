@@ -21,7 +21,5 @@ https://raw.githubusercontent.com/GWhim/idlepoe-assistant/master/idlepoe-assista
 ## 当前附加功能
 
 - 技能石手机端多选列表优化，支持槽位中文显示和长文本换行。
-- 单手双加一法杖默认打造方案。
-- 自定义打造支持内置工艺占位 `后缀：+10 ~ 13 全属性`。
 - 自定义打造在剥离/崇高后打印当前全部词缀。
 - 特殊条件 `是否有工艺多大师`，判断工艺后缀 `大师之`。

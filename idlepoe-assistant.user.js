@@ -1,16 +1,82 @@
 // ==UserScript==
-// @name         idlepoe 助手测试服版 2.164
+// @name         idlepoe 助手测试服版 2.17
 // @namespace    https://idlepoe.com
-// @version      2.164
+// @version      2.17
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @match        *://poe-test.faith.wang/*
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
-// @run-at       document-end
+// @grant        unsafeWindow
+// @run-at       document-start
 // ==/UserScript==
 
 (() => {
   'use strict';
+
+  const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
+  const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
+
+  /**
+   * installSkillTreeImportInterceptor 只替换一次天赋页 GET 响应，让网页原生组件加载导入方案。
+   * 这里不提交 POST /api/skilltree，最终保存仍由用户点击网页自己的“保存”按钮完成。
+   */
+  const installSkillTreeImportInterceptor = () => {
+    const targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    if (!targetWindow?.fetch || targetWindow.__poeAssistantSkillTreeImportInstalled) return;
+    targetWindow.__poeAssistantSkillTreeImportInstalled = true;
+    const originalFetch = targetWindow.fetch;
+    targetWindow.fetch = async function interceptedSkillTreeFetch(...args) {
+      const response = await originalFetch.apply(this, args);
+      let pendingText = '';
+      try {
+        pendingText = targetWindow.sessionStorage.getItem(SKILL_TREE_IMPORT_SESSION_KEY) || '';
+        if (!pendingText || !response?.ok) return response;
+        const input = args[0];
+        const requestUrl = typeof input === 'string' || input instanceof URL ? String(input) : String(input?.url || '');
+        const requestMethod = String(args[1]?.method || input?.method || 'GET').toUpperCase();
+        const pathname = new URL(requestUrl, targetWindow.location.origin).pathname;
+        if (requestMethod !== 'GET' || pathname !== '/api/skilltree') return response;
+
+        const pending = JSON.parse(pendingText);
+        const payload = await response.clone().json();
+        const data = payload?.data;
+        const currentSkills = Array.isArray(data?.skills) ? data.skills.map(String) : [];
+        const currentStart = String(data?.start || '');
+        if (currentStart && !currentSkills.includes(currentStart)) currentSkills.unshift(currentStart);
+        const importedSkills = Array.isArray(pending?.passives) ? pending.passives.map(String) : [];
+        const importedStart = String(pending?.start || '');
+        const totalPoints = Number(data?.points || 0) + Math.max(0, currentSkills.length - 1);
+        const requiredPoints = Math.max(0, importedSkills.length - 1);
+        if (!data || !importedStart || importedStart !== currentStart) throw new Error('职业起点与当前角色不一致');
+
+        data.skills = importedSkills;
+        data.masteries = pending.masteries && typeof pending.masteries === 'object' ? pending.masteries : {};
+        data.points = totalPoints - requiredPoints;
+        targetWindow.sessionStorage.removeItem(SKILL_TREE_IMPORT_SESSION_KEY);
+        targetWindow.sessionStorage.setItem(SKILL_TREE_IMPORT_STATUS_SESSION_KEY, JSON.stringify({
+          success: true,
+          message: `已把 ${requiredPoints} 点天赋载入当前页面，请检查后点击网页原生“保存”。`,
+        }));
+        const headers = new targetWindow.Headers(response.headers);
+        headers.delete('content-length');
+        headers.delete('content-encoding');
+        return new targetWindow.Response(JSON.stringify(payload), {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      } catch (error) {
+        targetWindow.sessionStorage.removeItem(SKILL_TREE_IMPORT_SESSION_KEY);
+        targetWindow.sessionStorage.setItem(SKILL_TREE_IMPORT_STATUS_SESSION_KEY, JSON.stringify({
+          success: false,
+          message: `导入天赋失败：${error.message}`,
+        }));
+        return response;
+      }
+    };
+  };
+
+  installSkillTreeImportInterceptor();
 
   /**
    * AssistantV2 是脚本唯一的命名空间，用来避免污染游戏页面的全局变量。
@@ -6584,6 +6650,8 @@
       battleWs: `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/battle/ws`,
       rankLevel: `${API_BASE_URL}/rank/level`,
       characterView: `${API_BASE_URL}/character/view`,
+      skillTree: `${API_BASE_URL}/skilltree`,
+      skillTreeData: `${API_BASE_URL}/skilltree/data`,
     },
   };
 
@@ -8634,6 +8702,427 @@
     if (!success) throw new Error('浏览器拒绝写入剪贴板。');
   };
 
+  const SKILL_TREE_EXPORT_PREFIX = 'T';
+  const SKILL_TREE_BINARY_EXPORT_PREFIX = 'P2T3:';
+  const LEGACY_SKILL_TREE_EXPORT_PREFIX = 'P2T2';
+
+  const calculateSkillTreeExportChecksum = (text) => {
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  };
+
+  const normalizeSkillTreeNodeIds = (values) => [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => Number.parseInt(value, 10))
+    .filter((value) => Number.isSafeInteger(value) && value >= 0))]
+    .sort((left, right) => left - right);
+
+  const encodeSkillTreeNodeIds = (values) => {
+    let previous = 0;
+    return normalizeSkillTreeNodeIds(values).map((value) => {
+      const delta = value - previous;
+      previous = value;
+      return delta.toString(36);
+    }).join(',');
+  };
+
+  const decodeSkillTreeNodeIds = (text) => {
+    if (!text) return [];
+    let previous = 0;
+    return String(text).split(',').map((token) => {
+      if (!/^[0-9a-z]+$/i.test(token)) throw new Error('天赋节点编码无效');
+      const delta = Number.parseInt(token, 36);
+      if (!Number.isSafeInteger(delta) || delta < 0) throw new Error('天赋节点编码超出范围');
+      previous += delta;
+      if (!Number.isSafeInteger(previous)) throw new Error('天赋节点编号超出范围');
+      return String(previous);
+    });
+  };
+
+  const encodeSkillTreeMasteries = (masteries) => {
+    let previous = 0;
+    return Object.entries(masteries || {})
+      .map(([nodeId, effectIndex]) => [Number.parseInt(nodeId, 10), Number.parseInt(effectIndex, 10)])
+      .filter(([nodeId, effectIndex]) => Number.isSafeInteger(nodeId) && nodeId >= 0 && Number.isInteger(effectIndex) && effectIndex >= 0)
+      .sort((left, right) => left[0] - right[0])
+      .map(([nodeId, effectIndex]) => {
+        const delta = nodeId - previous;
+        previous = nodeId;
+        return `${delta.toString(36)}:${effectIndex.toString(36)}`;
+      }).join(',');
+  };
+
+  const decodeSkillTreeMasteries = (text) => {
+    if (!text) return {};
+    let previous = 0;
+    const masteries = {};
+    String(text).split(',').forEach((entry) => {
+      const [deltaText, effectText, extra] = entry.split(':');
+      if (extra !== undefined || !/^[0-9a-z]+$/i.test(deltaText) || !/^[0-9a-z]+$/i.test(effectText)) {
+        throw new Error('专精编码无效');
+      }
+      previous += Number.parseInt(deltaText, 36);
+      const effectIndex = Number.parseInt(effectText, 36);
+      if (!Number.isSafeInteger(previous) || !Number.isInteger(effectIndex)) throw new Error('专精编码超出范围');
+      masteries[String(previous)] = effectIndex;
+    });
+    return masteries;
+  };
+
+  const appendSkillTreeVarUint = (bytes, value) => {
+    let remaining = Number(value);
+    if (!Number.isSafeInteger(remaining) || remaining < 0) throw new Error('天赋数据超出可编码范围');
+    while (remaining >= 128) {
+      bytes.push((remaining % 128) | 128);
+      remaining = Math.floor(remaining / 128);
+    }
+    bytes.push(remaining);
+  };
+
+  const readSkillTreeVarUint = (bytes, cursor) => {
+    let value = 0;
+    let multiplier = 1;
+    for (let index = 0; index < 8; index += 1) {
+      if (cursor.index >= bytes.length) throw new Error('天赋字符串数据不完整');
+      const byte = bytes[cursor.index];
+      cursor.index += 1;
+      value += (byte & 0x7f) * multiplier;
+      if (!Number.isSafeInteger(value)) throw new Error('天赋数据超出可解析范围');
+      if ((byte & 0x80) === 0) return value;
+      multiplier *= 128;
+    }
+    throw new Error('天赋变长整数编码无效');
+  };
+
+  const calculateSkillTreeBinaryChecksum = (bytes) => {
+    let hash = 2166136261;
+    for (const byte of bytes) {
+      hash ^= byte;
+      hash = Math.imul(hash, 16777619);
+    }
+    return hash >>> 0;
+  };
+
+  const skillTreeBytesToBase64Url = (bytes) => {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  };
+
+  const skillTreeBase64UrlToBytes = (text) => {
+    const encoded = String(text || '');
+    if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded) || encoded.length % 4 === 1) {
+      throw new Error('天赋字符串的 Base64URL 编码无效');
+    }
+    const padded = encoded.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - encoded.length % 4) % 4);
+    let binary;
+    try {
+      binary = atob(padded);
+    } catch {
+      throw new Error('天赋字符串的 Base64URL 编码无效');
+    }
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  };
+
+  const normalizeSkillTreeMasteries = (masteries) => Object.entries(masteries || {})
+    .map(([nodeId, effectIndex]) => [Number.parseInt(nodeId, 10), Number.parseInt(effectIndex, 10)])
+    .filter(([nodeId, effectIndex]) => Number.isSafeInteger(nodeId) && nodeId >= 0 && Number.isInteger(effectIndex) && effectIndex >= 0)
+    .sort((left, right) => left[0] - right[0]);
+
+  const encodeBinarySkillTreeExport = ({ classId, start, passives, masteries }) => {
+    const classNumber = Number.parseInt(classId, 10);
+    const startNumber = Number.parseInt(start, 10);
+    if (!Number.isInteger(classNumber) || !CHARACTER_CLASS_LABELS[classNumber]) throw new Error('当前角色缺少有效职业信息。');
+    if (!Number.isSafeInteger(startNumber) || startNumber < 0) throw new Error('当前天赋缺少有效职业起点。');
+    const nodeIds = normalizeSkillTreeNodeIds(passives);
+    const masteryEntries = normalizeSkillTreeMasteries(masteries);
+    const bytes = [];
+    appendSkillTreeVarUint(bytes, classNumber);
+    appendSkillTreeVarUint(bytes, startNumber);
+    appendSkillTreeVarUint(bytes, nodeIds.length);
+    let previous = 0;
+    nodeIds.forEach((nodeId) => {
+      appendSkillTreeVarUint(bytes, nodeId - previous);
+      previous = nodeId;
+    });
+    appendSkillTreeVarUint(bytes, masteryEntries.length);
+    previous = 0;
+    masteryEntries.forEach(([nodeId, effectIndex]) => {
+      appendSkillTreeVarUint(bytes, nodeId - previous);
+      appendSkillTreeVarUint(bytes, effectIndex);
+      previous = nodeId;
+    });
+    const checksum = calculateSkillTreeBinaryChecksum(bytes);
+    bytes.push(checksum & 0xff, (checksum >>> 8) & 0xff, (checksum >>> 16) & 0xff, (checksum >>> 24) & 0xff);
+    return `${SKILL_TREE_BINARY_EXPORT_PREFIX}${skillTreeBytesToBase64Url(bytes)}`;
+  };
+
+  const decodeLegacySkillTreeExport = (text) => {
+    const parts = text.split('.');
+    if (parts.length !== 6 || parts[0] !== LEGACY_SKILL_TREE_EXPORT_PREFIX) throw new Error('不是本插件支持的天赋字符串。');
+    const body = parts.slice(1, 5).join('.');
+    if (calculateSkillTreeExportChecksum(body) !== parts[5]) throw new Error('天赋字符串校验失败，内容可能不完整。');
+    if (!/^[0-9a-z]+$/i.test(parts[1]) || !/^[0-9a-z]+$/i.test(parts[2])) throw new Error('职业或起点编码无效。');
+    const classId = Number.parseInt(parts[1], 36);
+    const start = String(Number.parseInt(parts[2], 36));
+    const passives = decodeSkillTreeNodeIds(parts[3]);
+    const masteries = decodeSkillTreeMasteries(parts[4]);
+    if (!Number.isInteger(classId) || !CHARACTER_CLASS_LABELS[classId]) throw new Error('导入字符串包含未知职业。');
+    if (!passives.includes(start)) throw new Error('天赋字符串没有包含职业起点。');
+    return { classId, start, passives, masteries };
+  };
+
+  const decodeBinarySkillTreeExport = (text) => {
+    const bytes = skillTreeBase64UrlToBytes(text.slice(SKILL_TREE_BINARY_EXPORT_PREFIX.length));
+    if (bytes.length < 8) throw new Error('天赋字符串数据不完整。');
+    const payload = bytes.subarray(0, bytes.length - 4);
+    const checksumOffset = bytes.length - 4;
+    const expectedChecksum = (bytes[checksumOffset]
+      | (bytes[checksumOffset + 1] << 8)
+      | (bytes[checksumOffset + 2] << 16)
+      | (bytes[checksumOffset + 3] << 24)) >>> 0;
+    if (calculateSkillTreeBinaryChecksum(payload) !== expectedChecksum) throw new Error('天赋字符串校验失败，内容可能不完整。');
+    const cursor = { index: 0 };
+    const classId = readSkillTreeVarUint(payload, cursor);
+    const start = String(readSkillTreeVarUint(payload, cursor));
+    const passiveCount = readSkillTreeVarUint(payload, cursor);
+    if (passiveCount > 10000) throw new Error('天赋节点数量异常。');
+    const passives = [];
+    let previous = 0;
+    for (let index = 0; index < passiveCount; index += 1) {
+      previous += readSkillTreeVarUint(payload, cursor);
+      if (!Number.isSafeInteger(previous)) throw new Error('天赋节点编号超出范围。');
+      passives.push(String(previous));
+    }
+    const masteryCount = readSkillTreeVarUint(payload, cursor);
+    if (masteryCount > 10000) throw new Error('专精数量异常。');
+    const masteries = {};
+    previous = 0;
+    for (let index = 0; index < masteryCount; index += 1) {
+      previous += readSkillTreeVarUint(payload, cursor);
+      const effectIndex = readSkillTreeVarUint(payload, cursor);
+      if (!Number.isSafeInteger(previous)) throw new Error('专精节点编号超出范围。');
+      masteries[String(previous)] = effectIndex;
+    }
+    if (cursor.index !== payload.length) throw new Error('天赋字符串包含无法识别的额外数据。');
+    if (!Number.isInteger(classId) || !CHARACTER_CLASS_LABELS[classId]) throw new Error('导入字符串包含未知职业。');
+    if (!passives.includes(start)) throw new Error('天赋字符串没有包含职业起点。');
+    return { classId, start, passives, masteries };
+  };
+
+  const getSkillTreeNodeDictionary = (treeData) => {
+    const nodes = treeData?.nodes;
+    if (!nodes || typeof nodes !== 'object') throw new Error('网页天赋节点数据尚未加载。');
+    const dictionary = normalizeSkillTreeNodeIds(Object.keys(nodes)).map(String);
+    if (!dictionary.length) throw new Error('当前版本的天赋节点字典为空。');
+    return dictionary;
+  };
+
+  const calculateSkillTreeDictionaryFingerprint = (dictionary) => {
+    const bytes = [];
+    appendSkillTreeVarUint(bytes, dictionary.length);
+    let previous = 0;
+    dictionary.forEach((nodeId) => {
+      const numericId = Number(nodeId);
+      appendSkillTreeVarUint(bytes, numericId - previous);
+      previous = numericId;
+    });
+    return calculateSkillTreeBinaryChecksum(bytes) & 0xffff;
+  };
+
+  const encodeSkillTreeExport = ({ classId, start, passives, masteries, treeData }) => {
+    const classNumber = Number.parseInt(classId, 10);
+    const startNumber = Number.parseInt(start, 10);
+    if (!Number.isInteger(classNumber) || !CHARACTER_CLASS_LABELS[classNumber]) throw new Error('当前角色缺少有效职业信息。');
+    if (!Number.isSafeInteger(startNumber) || startNumber < 0) throw new Error('当前天赋缺少有效职业起点。');
+    const dictionary = getSkillTreeNodeDictionary(treeData);
+    const dictionaryIndexByNodeId = new Map(dictionary.map((nodeId, index) => [nodeId, index]));
+    const selectedNodeIds = normalizeSkillTreeNodeIds(passives).map(String);
+    if (!selectedNodeIds.includes(String(startNumber))) throw new Error('当前天赋没有包含职业起点。');
+    const selectedEntries = selectedNodeIds
+      .filter((nodeId) => nodeId !== String(startNumber))
+      .map((nodeId) => {
+        const dictionaryIndex = dictionaryIndexByNodeId.get(nodeId);
+        if (dictionaryIndex === undefined) throw new Error(`当前版本不存在天赋节点：${nodeId}`);
+        return [dictionaryIndex, nodeId];
+      })
+      .sort((left, right) => left[0] - right[0]);
+    const selectedPositionByNodeId = new Map(selectedEntries.map((entry, index) => [entry[1], index]));
+    const masteryEntries = normalizeSkillTreeMasteries(masteries)
+      .map(([nodeId, effectIndex]) => [selectedPositionByNodeId.get(String(nodeId)), effectIndex])
+      .filter(([selectedPosition]) => selectedPosition !== undefined)
+      .sort((left, right) => left[0] - right[0]);
+
+    const bytes = [];
+    const fingerprint = calculateSkillTreeDictionaryFingerprint(dictionary);
+    bytes.push(fingerprint & 0xff, (fingerprint >>> 8) & 0xff);
+    appendSkillTreeVarUint(bytes, selectedEntries.length);
+    let previous = 0;
+    selectedEntries.forEach(([dictionaryIndex]) => {
+      appendSkillTreeVarUint(bytes, dictionaryIndex - previous);
+      previous = dictionaryIndex;
+    });
+    appendSkillTreeVarUint(bytes, masteryEntries.length);
+    previous = 0;
+    masteryEntries.forEach(([selectedPosition, effectIndex]) => {
+      appendSkillTreeVarUint(bytes, selectedPosition - previous);
+      appendSkillTreeVarUint(bytes, effectIndex);
+      previous = selectedPosition;
+    });
+    const checksum = calculateSkillTreeBinaryChecksum([classNumber, ...bytes]) & 0xffff;
+    bytes.push(checksum & 0xff, (checksum >>> 8) & 0xff);
+    return `${SKILL_TREE_EXPORT_PREFIX}${classNumber}${skillTreeBytesToBase64Url(bytes)}`;
+  };
+
+  const decodeCompactSkillTreeExport = (text, { treeData, start } = {}) => {
+    const match = /^T([1-7])([A-Za-z0-9_-]+)$/.exec(text);
+    if (!match) throw new Error('紧凑天赋字符串格式无效。');
+    const classId = Number(match[1]);
+    const startId = String(start || '');
+    if (!startId) throw new Error('当前天赋缺少有效职业起点。');
+    const bytes = skillTreeBase64UrlToBytes(match[2]);
+    if (bytes.length < 6) throw new Error('天赋字符串数据不完整。');
+    const payload = bytes.subarray(0, bytes.length - 2);
+    const checksumOffset = bytes.length - 2;
+    const expectedChecksum = bytes[checksumOffset] | (bytes[checksumOffset + 1] << 8);
+    if ((calculateSkillTreeBinaryChecksum([classId, ...payload]) & 0xffff) !== expectedChecksum) {
+      throw new Error('天赋字符串校验失败，内容可能不完整。');
+    }
+    const dictionary = getSkillTreeNodeDictionary(treeData);
+    const expectedFingerprint = payload[0] | (payload[1] << 8);
+    if (calculateSkillTreeDictionaryFingerprint(dictionary) !== expectedFingerprint) {
+      throw new Error('天赋字符串对应的天赋树版本与当前页面不一致。');
+    }
+    const cursor = { index: 2 };
+    const passiveCount = readSkillTreeVarUint(payload, cursor);
+    if (passiveCount > dictionary.length) throw new Error('天赋节点数量异常。');
+    const selectedNodeIds = [];
+    let previous = 0;
+    for (let index = 0; index < passiveCount; index += 1) {
+      const delta = readSkillTreeVarUint(payload, cursor);
+      if (index > 0 && delta === 0) throw new Error('天赋节点索引重复。');
+      previous += delta;
+      if (previous >= dictionary.length) throw new Error('天赋节点索引超出当前版本范围。');
+      const nodeId = dictionary[previous];
+      if (nodeId === startId) throw new Error('天赋字符串重复包含职业起点。');
+      selectedNodeIds.push(nodeId);
+    }
+    const masteryCount = readSkillTreeVarUint(payload, cursor);
+    if (masteryCount > passiveCount) throw new Error('专精数量异常。');
+    const masteries = {};
+    previous = 0;
+    for (let index = 0; index < masteryCount; index += 1) {
+      const delta = readSkillTreeVarUint(payload, cursor);
+      if (index > 0 && delta === 0) throw new Error('专精节点索引重复。');
+      previous += delta;
+      if (previous >= selectedNodeIds.length) throw new Error('专精节点索引超出已选节点范围。');
+      masteries[selectedNodeIds[previous]] = readSkillTreeVarUint(payload, cursor);
+    }
+    if (cursor.index !== payload.length) throw new Error('天赋字符串包含无法识别的额外数据。');
+    return { classId, start: startId, passives: [startId, ...selectedNodeIds], masteries };
+  };
+
+  const decodeSkillTreeExport = (text, context) => {
+    const normalized = String(text || '').trim();
+    if (/^T[1-7]/.test(normalized)) return decodeCompactSkillTreeExport(normalized, context);
+    if (normalized.startsWith(SKILL_TREE_BINARY_EXPORT_PREFIX)) return decodeBinarySkillTreeExport(normalized);
+    if (normalized.startsWith(`${LEGACY_SKILL_TREE_EXPORT_PREFIX}.`)) return decodeLegacySkillTreeExport(normalized);
+    throw new Error('不是本插件支持的天赋字符串。');
+  };
+
+  const exportSkillTree = async () => {
+    const [payload, treePayload, characterPayload] = await Promise.all([
+      requestJson(config.endpoints.skillTree),
+      requestJson(config.endpoints.skillTreeData),
+      requestJson(config.endpoints.character),
+    ]);
+    if (payload?.success === false || !payload?.data) throw new Error(payload?.message || '读取天赋失败。');
+    if (!treePayload?.data) throw new Error('读取当前版本天赋节点字典失败。');
+    if (!characterPayload?.data) throw new Error('读取当前角色职业失败。');
+    const data = payload.data;
+    const passives = Array.isArray(data.skills) ? data.skills.map(String) : [];
+    const start = String(data.start || '');
+    if (start && !passives.includes(start)) passives.unshift(start);
+    const classId = Number(characterPayload.data.class || 0);
+    const className = CHARACTER_CLASS_LABELS[classId] || `未知职业(${classId})`;
+    const exportText = encodeSkillTreeExport({
+      classId,
+      start,
+      passives,
+      masteries: data.masteries || {},
+      treeData: treePayload.data,
+    });
+    state.ui.skillTreeTransferText.value = exportText;
+    state.ui.skillTreeTransferSummary.textContent = `已导出${className}当前保存的天赋：${Math.max(0, passives.length - 1)} 点，${Object.keys(data.masteries || {}).length} 个专精；字符串 ${exportText.length} 字符。`;
+    try {
+      await copyTextToClipboard(exportText);
+      addLog('天赋字符串已导出并复制到剪贴板。', 'compact');
+    } catch (error) {
+      addLog(`天赋已导出到文本框，但自动复制失败：${error.message}`, 'warn');
+    }
+  };
+
+  const validateImportedSkillTree = (imported, currentData, treeData, currentCharacter) => {
+    const currentClassId = Number(currentCharacter?.class || 0);
+    if (imported.classId !== currentClassId) {
+      const currentClassName = CHARACTER_CLASS_LABELS[currentClassId] || `未知职业(${currentClassId})`;
+      const importedClassName = CHARACTER_CLASS_LABELS[imported.classId] || `未知职业(${imported.classId})`;
+      throw new Error(`请先切换职业，当前职业为：${currentClassName}，导入职业为：${importedClassName}。`);
+    }
+    const currentStart = String(currentData?.start || '');
+    if (!currentStart || imported.start !== currentStart) throw new Error('当前职业的天赋起点与导入数据不一致，可能是天赋版本已经更新。');
+    const nodes = treeData?.nodes;
+    if (!nodes || typeof nodes !== 'object') throw new Error('网页天赋节点数据尚未加载。');
+    const selectedSet = new Set(imported.passives.map(String));
+    for (const nodeId of selectedSet) {
+      if (!nodes[nodeId]) throw new Error(`导入天赋包含当前版本不存在的节点：${nodeId}`);
+    }
+    const visited = new Set([currentStart]);
+    const queue = [currentStart];
+    while (queue.length) {
+      const nodeId = queue.shift();
+      const node = nodes[nodeId] || {};
+      const linkedIds = [...(Array.isArray(node.in) ? node.in : []), ...(Array.isArray(node.out) ? node.out : [])].map(String);
+      linkedIds.forEach((linkedId) => {
+        if (selectedSet.has(linkedId) && !visited.has(linkedId)) {
+          visited.add(linkedId);
+          queue.push(linkedId);
+        }
+      });
+    }
+    if (visited.size !== selectedSet.size) throw new Error('导入天赋存在与职业起点不连通的节点。');
+
+    for (const [nodeId, effectIndex] of Object.entries(imported.masteries)) {
+      const node = nodes[nodeId];
+      if (!selectedSet.has(nodeId) || !node?.isMastery) throw new Error(`专精节点 ${nodeId} 未被正确点亮。`);
+      if (!Number.isInteger(effectIndex) || effectIndex < 0 || effectIndex >= (node.masteryEffects?.length || 0)) {
+        throw new Error(`专精节点 ${nodeId} 的选项已不适用于当前版本。`);
+      }
+    }
+
+  };
+
+  const importSkillTreeToPage = async () => {
+    if (!/^\/skilltree\/?$/.test(location.pathname)) throw new Error('导入天赋必须在网页“天赋”页面执行。');
+    const importText = state.ui.skillTreeTransferText?.value;
+    const [currentPayload, treePayload, characterPayload] = await Promise.all([
+      requestJson(config.endpoints.skillTree),
+      requestJson(config.endpoints.skillTreeData),
+      requestJson(config.endpoints.character),
+    ]);
+    if (!currentPayload?.data || !treePayload?.data || !characterPayload?.data) throw new Error('读取当前天赋页面数据失败。');
+    const imported = decodeSkillTreeExport(importText, {
+      treeData: treePayload.data,
+      start: currentPayload.data.start,
+    });
+    validateImportedSkillTree(imported, currentPayload.data, treePayload.data, characterPayload.data);
+    sessionStorage.setItem(SKILL_TREE_IMPORT_SESSION_KEY, JSON.stringify(imported));
+    location.reload();
+  };
+
   /**
    * copySelectedRankBattleInfo 生成当前玩家战斗信息并复制到剪贴板。
    */
@@ -9033,53 +9522,6 @@
     return state.craftBench.list.find((craft) => craft.craftId === normalizedCraftId) || null;
   };
 
-  const getContinuousBuiltinCraftToken = (step) => {
-    const note = String(step?.note || '');
-    return Object.values(BUILTIN_CONTINUOUS_CRAFT_TOKENS).find((token) => note.includes(token)) || '';
-  };
-
-  const getCraftBenchMaskByCategory = (categoryValue) => (
-    CRAFT_BENCH_CATEGORY_OPTIONS.find((option) => option.value === categoryValue)?.mask || 0n
-  );
-
-  const findAllAttributes10To13SuffixCraft = (categoryValue, equipment) => {
-    const equipmentMask = equipment ? parseEquipmentTypeMask(equipment?.equipmentType) : getCraftBenchMaskByCategory(categoryValue);
-    return (Array.isArray(state.craftBench?.list) ? state.craftBench.list : [])
-      .filter((craft) => getCraftBenchPositionType(craft) === 'suffix')
-      .filter((craft) => isCraftBenchForMask(craft, equipmentMask))
-      .filter((craft) => /全属性/.test(String(craft?.searchText || craft?.label || '')))
-      .find((craft) => {
-        const numbers = (String(craft?.searchText || craft?.label || '').match(/\d+/g) || [])
-          .map((value) => Number.parseInt(value, 10))
-          .filter(Number.isFinite);
-        return numbers.includes(10) && numbers.includes(13);
-      }) || null;
-  };
-
-  const resolveBuiltinContinuousCraftBench = (step, equipment) => {
-    const token = getContinuousBuiltinCraftToken(step);
-    if (!token) return null;
-    if (token === BUILTIN_CONTINUOUS_CRAFT_TOKENS.allAttributes10To13Suffix) {
-      return findAllAttributes10To13SuffixCraft(step?.craftCategory, equipment);
-    }
-    return null;
-  };
-
-  const resolveContinuousCraftBenchIdFromLoadedList = (step, equipment) => {
-    if (step?.craftId) return String(step.craftId);
-    const craft = resolveBuiltinContinuousCraftBench(step, equipment);
-    return craft?.craftId ? String(craft.craftId) : '';
-  };
-
-  const resolveContinuousCraftBenchIdForExecution = async (step, equipment) => {
-    const directCraftId = resolveContinuousCraftBenchIdFromLoadedList(step, equipment);
-    if (directCraftId) return directCraftId;
-    await ensureCraftBenchList();
-    const resolvedCraftId = resolveContinuousCraftBenchIdFromLoadedList(step, equipment);
-    if (resolvedCraftId) return resolvedCraftId;
-    throw new Error('未找到可用的后缀：+10 ~ 13 全属性工艺，请先确认工艺列表已加载且当前装备类型可用。');
-  };
-
   const getCraftBenchCost = (craft, equipment) => {
     const cost = { ...(craft?.cost || {}) };
     if (equipment?.corrupted && craft?.allowOnCorrupted) {
@@ -9237,7 +9679,7 @@
     }))
   ));
 
-  const applyCraftBench = async (equipment, craftId) => {
+  const applyCraftBench = async (equipment, craftId, { continueOnBackendRejection = false } = {}) => {
     await ensureCraftBenchList();
     const craft = getCraftBenchById(craftId);
     if (!craft) throw new Error('请先选择工艺词缀。');
@@ -9250,11 +9692,19 @@
     }
     recordStepExecution('工艺');
     addMainLog(`${equipment.name} 使用工艺：${craft.label}。`);
-    const payload = await requestJson(config.endpoints.craftApply, {
-      method: 'POST',
-      body: { equipmentId: equipment.id, craftId: craft.craftId },
-    });
-    if (payload.success === false) throw new Error(payload.message || '工艺改造失败');
+    let payload;
+    try {
+      payload = await requestJson(config.endpoints.craftApply, {
+        method: 'POST',
+        body: { equipmentId: equipment.id, craftId: craft.craftId },
+      });
+      if (payload.success === false) throw new Error(payload.message || '工艺改造失败');
+    } catch (error) {
+      if (!continueOnBackendRejection) throw error;
+      addLog(`${equipment.name} 存在多大师工艺，已尝试工艺但被后端拒绝：${error.message}；继续执行后续步骤。`, 'warn');
+      await wait(getSpeedDelay());
+      return false;
+    }
     const updatedEquipment = payload.data?.equipment || payload.data;
     if (updatedEquipment) mergeEquipmentUpdate(equipment, updatedEquipment);
     const cost = getCraftBenchCost(craft, equipment);
@@ -9267,11 +9717,14 @@
   const hasCraftedAffix = (equipment) => (Array.isArray(equipment?.affixes) ? equipment.affixes : [])
     .some((affix) => affix?.isCrafted === true);
 
-  const hasCraftedMultimodAffix = (equipment) => (Array.isArray(equipment?.affixes) ? equipment.affixes : [])
+  const hasMultiMasterCraftAffix = (equipment) => (Array.isArray(equipment?.affixes) ? equipment.affixes : [])
     .some((affix) => (
-      affix?.isCrafted === true
-      && normalizeAffixPositionType(affix) === 'suffix'
-      && String(affix?.name || affix?.affixName || '').trim() === '大师之'
+      Object.prototype.hasOwnProperty.call(affix?.magics || {}, '552')
+      || (
+        affix?.isCrafted === true
+        && normalizeAffixPositionType(affix) === 'suffix'
+        && String(affix?.name || affix?.affixName || '').trim() === '大师之'
+      )
     ));
 
   const getCraftBenchPositionType = (craft) => {
@@ -9295,18 +9748,24 @@
     await ensureCraftBenchList();
     const craft = getCraftBenchById(craftId);
     if (!craft) throw new Error('请先选择工艺词缀。');
-    if (hasCraftedAffix(equipment)) {
+    const hasMultiMasterCraft = hasMultiMasterCraftAffix(equipment);
+    if (hasCraftedAffix(equipment) && !hasMultiMasterCraft) {
       addStepLog(`${equipment.name} 已有工艺词缀，智能工艺跳过。`);
       await wait(getSpeedDelay());
       return true;
     }
-    if (shouldSkipSmartCraftBenchForFullAffix(equipment, craft)) {
+    if (shouldSkipSmartCraftBenchForFullAffix(equipment, craft) && !hasMultiMasterCraft) {
       const positionText = getCraftBenchPositionType(craft) === 'prefix' ? '前缀' : '后缀';
       addStepLog(`${equipment.name} ${positionText}已满，智能工艺跳过：${craft.label}。`);
       await wait(getSpeedDelay());
       return true;
     }
-    await applyCraftBench(equipment, craftId);
+    if (hasMultiMasterCraft) addStepLog(`${equipment.name} 存在多大师工艺，智能工艺强制尝试：${craft.label}。`);
+    const applied = await applyCraftBench(equipment, craftId, { continueOnBackendRejection: hasMultiMasterCraft });
+    if (!applied && hasMultiMasterCraft) {
+      addStepLog(`${equipment.name} 多大师智能工艺请求未成功，已忽略并继续。`);
+      return true;
+    }
     addStepLog(`${equipment.name} 智能工艺已执行。`);
     return true;
   };
@@ -10696,119 +11155,6 @@
     createContinuousCraftStep('regal'),
   ];
 
-  const BUILTIN_CONTINUOUS_CRAFT_TOKENS = {
-    allAttributes10To13Suffix: '__builtin_all_attributes_10_to_13_suffix__',
-  };
-
-  const BUILTIN_CRAFT_PLAN_IDS = {
-    oneHandWandDualPlusOneAltAugRegal: 'builtin-one-hand-wand-dual-plus-one-alt-aug-regal',
-  };
-
-  const createAffixNameCondition = (name, affixType = '') => normalizeAffixCondition({
-    kind: 'affix',
-    name,
-    affixType,
-  });
-
-  const createSpecialMetricCondition = (metric, operator, value) => normalizeAffixCondition({
-    kind: 'special',
-    metric,
-    operator,
-    value,
-  });
-
-  const createTargetConditionGroups = (targetConditions, minRequired) => [normalizeAffixConditionGroup({
-    conditions: targetConditions.map((condition) => createAffixNameCondition(condition.name, condition.affixType)),
-    minRequired,
-  })];
-
-  const createSpecialConditionGroup = (metric, operator, value) => normalizeAffixConditionGroup({
-    conditions: [createSpecialMetricCondition(metric, operator, value)],
-    minRequired: 1,
-  });
-
-  const getDefaultDualPlusOneContinuousCraftSteps = ({ craftCategory, targetConditions, keepPrefix }) => {
-    const anyOneTargetGroups = createTargetConditionGroups(targetConditions, 1);
-    const anyTwoTargetGroups = createTargetConditionGroups(targetConditions, 2);
-    const keepPrefixGroups = [normalizeAffixConditionGroup({
-      conditions: [createAffixNameCondition(keepPrefix.name, keepPrefix.affixType)],
-      minRequired: 1,
-    })];
-    const prefixCountIsFullGroups = [createSpecialConditionGroup('prefixCount', 'eq', 3)];
-    const craftedAffixGroups = [createSpecialConditionGroup('crafted', 'eq', true)];
-    return [
-      createContinuousCraftStep('ensureMagic', [createEmptyAffixConditionGroup()], 'jump', 'jump', 1, 0, craftCategory),
-      createContinuousCraftStep('conditionCheck', anyOneTargetGroups, 'jump', 'jump', 3, 2, craftCategory),
-      createContinuousCraftStep('alteration', [createEmptyAffixConditionGroup()], 'jump', 'jump', 3, 0, craftCategory),
-      createContinuousCraftStep('smartAugment', [createEmptyAffixConditionGroup()], 'jump', 'jump', 4, 0, craftCategory),
-      createContinuousCraftStep('conditionCheck', anyOneTargetGroups, 'jump', 'jump', 5, 0, craftCategory),
-      createContinuousCraftStep('regal', [createEmptyAffixConditionGroup()], 'jump', 'jump', 6, 0, craftCategory),
-      createContinuousCraftStep('conditionCheck', anyTwoTargetGroups, 'jump', 'terminateSuccess', null, 7, craftCategory),
-      createContinuousCraftStep('conditionCheck', anyOneTargetGroups, 'jump', 'jump', 8, 0, craftCategory),
-      createContinuousCraftStep(
-        'smartCraftBench',
-        [createEmptyAffixConditionGroup()],
-        'jump',
-        'jump',
-        9,
-        0,
-        craftCategory,
-        '',
-        BUILTIN_CONTINUOUS_CRAFT_TOKENS.allAttributes10To13Suffix,
-      ),
-      createContinuousCraftStep('conditionCheck', anyOneTargetGroups, 'jump', 'jump', 10, 0, craftCategory),
-      createContinuousCraftStep('conditionCheck', anyTwoTargetGroups, 'jump', 'terminateSuccess', null, 11, craftCategory),
-      createContinuousCraftStep('conditionCheck', prefixCountIsFullGroups, 'jump', 'jump', 16, 12, craftCategory),
-      createContinuousCraftStep('exalted', [createEmptyAffixConditionGroup()], 'jump', 'jump', 13, 0, craftCategory),
-      createContinuousCraftStep('conditionCheck', anyTwoTargetGroups, 'jump', 'terminateSuccess', null, 14, craftCategory),
-      createContinuousCraftStep('conditionCheck', anyOneTargetGroups, 'jump', 'jump', 15, 0, craftCategory),
-      createContinuousCraftStep('conditionCheck', keepPrefixGroups, 'jump', 'jump', 11, 16, craftCategory),
-      createContinuousCraftStep('annulment', [createEmptyAffixConditionGroup()], 'jump', 'jump', 17, 0, craftCategory),
-      createContinuousCraftStep('conditionCheck', anyTwoTargetGroups, 'jump', 'terminateSuccess', null, 18, craftCategory),
-      createContinuousCraftStep('conditionCheck', anyOneTargetGroups, 'jump', 'jump', 19, 0, craftCategory),
-      createContinuousCraftStep('conditionCheck', craftedAffixGroups, 'jump', 'jump', 11, 8, craftCategory),
-    ];
-  };
-
-  const createDefaultDualPlusOneCraftPlan = ({
-    id,
-    name,
-    keyword,
-    craftCategory,
-    targetConditions,
-    keepPrefix,
-    updatedAt,
-  }) => normalizeCraftPlan({
-    id,
-    name,
-    updatedAt,
-    options: {
-      keyword,
-      rarity: RARITY_TYPES.normal,
-      targetCount: 1,
-      useStorage: false,
-      continuousCraftSteps: getDefaultDualPlusOneContinuousCraftSteps({
-        craftCategory,
-        targetConditions,
-        keepPrefix,
-      }),
-    },
-  });
-
-  const createDefaultOneHandWandDualPlusOneCraftPlan = () => createDefaultDualPlusOneCraftPlan({
-    id: BUILTIN_CRAFT_PLAN_IDS.oneHandWandDualPlusOneAltAugRegal,
-    name: '单手双加一法杖（改造增幅富豪+工艺崇高剥离）',
-    keyword: '法杖',
-    craftCategory: 'oneHandWeapons',
-    targetConditions: [
-      { name: '导师的', affixType: '所有法术主动技能石等级(单手)' },
-      { name: '塑焰的', affixType: '法术主动技能石等级(单手)' },
-      { name: '雷手的', affixType: '法术主动技能石等级(单手)' },
-    ],
-    keepPrefix: { name: '锋芒的', affixType: '法术伤害提高(单手)' },
-    updatedAt: 1784332800000,
-  });
-
   /**
    * normalizeContinuousCraftStep 清洗单个连续打造步骤。
    * @param {object} rawStep 原始步骤。
@@ -10899,7 +11245,7 @@
       step.failureTargetStepIndex,
       step.craftCategory,
       step.craftId,
-      step.note,
+      '',
       step.gardenCraftCategory,
       step.gardenCraftKey,
     ));
@@ -11675,7 +12021,7 @@
     if (metric === 'rarity') return Number(equipment?.rarity || RARITY_TYPES.normal);
     if (metric === 'corrupted') return Boolean(equipment?.corrupted);
     if (metric === 'crafted') return hasCraftedAffix(equipment);
-    if (metric === 'craftedMultimod') return hasCraftedMultimodAffix(equipment);
+    if (metric === 'craftedMultimod') return hasMultiMasterCraftAffix(equipment);
     if (metric === 'openPrefix') return affixSummary.prefixCount < affixSlotLimits.prefix;
     if (metric === 'openSuffix') return affixSummary.suffixCount < affixSlotLimits.suffix;
     if (metric === 'openAffix') {
@@ -12076,20 +12422,6 @@
     .map(normalizeCraftPlan)
     .filter(Boolean);
 
-  const getBuiltinCraftPlans = () => [
-    createDefaultOneHandWandDualPlusOneCraftPlan(),
-  ].filter(Boolean);
-
-  const mergeBuiltinCraftPlans = (rawPlans) => {
-    const normalizedPlans = normalizeCraftPlanList(rawPlans);
-    const planMap = new Map(normalizedPlans.map((plan) => [plan.id, plan]));
-    getBuiltinCraftPlans().forEach((plan) => {
-      if (!plan) return;
-      planMap.set(plan.id, plan);
-    });
-    return [...planMap.values()].sort((left, right) => right.updatedAt - left.updatedAt);
-  };
-
   /**
    * encodeBytesBase64Url 把压缩后的字节编码为 base64url。
    * @param {Uint8Array} bytes 原始字节。
@@ -12356,7 +12688,7 @@
    * persistCraftPlans 把当前方案列表保存到浏览器本地存储。
    */
   const persistCraftPlans = () => {
-    state.craftPlans = mergeBuiltinCraftPlans(state.craftPlans);
+    state.craftPlans = normalizeCraftPlanList(state.craftPlans);
     writeAssistantStorageJson(STORAGE_KEYS.craftPlans, state.craftPlans);
   };
 
@@ -13942,7 +14274,7 @@
       if (!conditionGroups.length && actionConfig.requiresConditions) {
         throw new Error(`${stepLabel} 需要至少添加一个词缀条件。`);
       }
-      if (['craftBench', 'smartCraftBench'].includes(step.action) && !step.craftId && !getContinuousBuiltinCraftToken(step)) {
+      if (['craftBench', 'smartCraftBench'].includes(step.action) && !step.craftId) {
         throw new Error(`${stepLabel} 需要先选择具体工艺词缀。`);
       }
       if (step.action === 'gardenCraft' && !step.gardenCraftKey) {
@@ -14089,13 +14421,11 @@
       return true;
     }
     if (normalizedStep.action === 'smartCraftBench') {
-      const craftId = await resolveContinuousCraftBenchIdForExecution(normalizedStep, equipment);
-      await applySmartCraftBench(equipment, craftId);
+      await applySmartCraftBench(equipment, normalizedStep.craftId);
       return true;
     }
     if (normalizedStep.action === 'craftBench') {
-      const craftId = await resolveContinuousCraftBenchIdForExecution(normalizedStep, equipment);
-      await applyCraftBench(equipment, craftId);
+      await applyCraftBench(equipment, normalizedStep.craftId);
       addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 工艺完成。`);
       return true;
     }
@@ -15987,13 +16317,13 @@
 
   /**
    * togglePositionAdjustMode 切换外部悬浮入口按钮的调位模式。
-   * 调位模式开启后可拖动“助手 2.16”按钮；再次点击关闭并保留当前位置。
+   * 调位模式开启后可拖动“助手 2.17”按钮；再次点击关闭并保留当前位置。
    */
   const togglePositionAdjustMode = () => {
     state.isTogglePositionMode = !state.isTogglePositionMode;
     state.ui.toggleButton?.classList.toggle('poe2-toggle-positioning', state.isTogglePositionMode);
     if (state.isTogglePositionMode) {
-      addLog('已开启调整位置模式：拖动外部“助手 2.16”按钮即可改变入口位置，再次点击“调整位置”关闭。', 'compact');
+      addLog('已开启调整位置模式：拖动外部“助手 2.17”按钮即可改变入口位置，再次点击“调整位置”关闭。', 'compact');
     } else {
       addLog('已关闭调整位置模式，外部入口按钮位置已保存。', 'compact');
     }
@@ -16808,13 +17138,10 @@
       const effectiveGroups = step.conditionGroups.filter((group) => group.conditions.length > 0);
       const usesCraftBenchSelection = ['craftBench', 'smartCraftBench'].includes(step.action);
       const usesGardenCraftSelection = step.action === 'gardenCraft';
-      const craft = usesCraftBenchSelection ? (getCraftBenchById(step.craftId) || resolveBuiltinContinuousCraftBench(step, null)) : null;
-      const builtinCraftText = getContinuousBuiltinCraftToken(step) === BUILTIN_CONTINUOUS_CRAFT_TOKENS.allAttributes10To13Suffix
-        ? '后缀：+10 ~ 13 全属性'
-        : '';
+      const craft = usesCraftBenchSelection ? getCraftBenchById(step.craftId) : null;
       const gardenCraft = usesGardenCraftSelection ? getGardenCraftByKey(step.gardenCraftCategory, step.gardenCraftKey) : null;
       const craftText = usesCraftBenchSelection
-        ? `：${craft?.label || builtinCraftText || (step.craftId ? `工艺 ID ${step.craftId}` : '未选择工艺')}`
+        ? `：${craft?.label || (step.craftId ? `工艺 ID ${step.craftId}` : '未选择工艺')}`
         : usesGardenCraftSelection
           ? `：${gardenCraft?.label || (step.gardenCraftKey ? `花园工艺 ${step.gardenCraftKey}` : '未选择花园工艺')}`
         : '';
@@ -16872,10 +17199,7 @@
       const effectiveGroups = step.conditionGroups.filter((group) => group.conditions.length > 0);
       const usesCraftBenchSelection = ['craftBench', 'smartCraftBench'].includes(step.action);
       const usesGardenCraftSelection = step.action === 'gardenCraft';
-      const craft = usesCraftBenchSelection ? (getCraftBenchById(step.craftId) || resolveBuiltinContinuousCraftBench(step, null)) : null;
-      const builtinCraftText = getContinuousBuiltinCraftToken(step) === BUILTIN_CONTINUOUS_CRAFT_TOKENS.allAttributes10To13Suffix
-        ? '后缀：+10 ~ 13 全属性'
-        : '';
+      const craft = usesCraftBenchSelection ? getCraftBenchById(step.craftId) : null;
       const gardenCraft = usesGardenCraftSelection ? getGardenCraftByKey(step.gardenCraftCategory, step.gardenCraftKey) : null;
       const stepCode = formatContinuousStepCode(stepIndex);
       const successText = step.successHandling === 'jump'
@@ -16891,8 +17215,6 @@
       const actionText = `${actionLabel}${
         craft
           ? `：${craft.label}`
-          : builtinCraftText
-            ? `：${builtinCraftText}`
           : gardenCraft
             ? `：${gardenCraft.label}`
             : usesCraftBenchSelection
@@ -16944,7 +17266,7 @@
       state.ui.continuousCraftIdSelect
         ? (state.ui.continuousCraftIdSelect.value || state.ui.continuousCraftIdSelect.dataset.pendingCraftId || '')
         : steps[activeIndex].craftId,
-      steps[activeIndex].note,
+      '',
       state.ui.continuousGardenCategorySelect?.value || steps[activeIndex].gardenCraftCategory,
       state.ui.continuousGardenCraftSelect
         ? (state.ui.continuousGardenCraftSelect.value || state.ui.continuousGardenCraftSelect.dataset.pendingGardenCraftKey || '')
@@ -17521,6 +17843,7 @@
         label: '数据分析',
         children: [
           sections.battleAnalysisSection,
+          sections.skillTreeTransferSection,
           sections.rankAnalysisSection,
         ],
       },
@@ -17667,6 +17990,62 @@
           children: [startButton, stopButton, resetButton],
         }),
         state.ui.battleAnalysisSummary,
+      ],
+    });
+  };
+
+  /**
+   * createSkillTreeTransferSection 创建天赋导入导出区。
+   * 导入只暂存并刷新天赋页面，不会直接调用保存接口。
+   */
+  const createSkillTreeTransferSection = () => {
+    state.ui.skillTreeTransferText = createElement('textarea', {
+      className: 'poe2-input poe2-textarea',
+      placeholder: '点击导出生成字符串，或粘贴本插件生成的 T1…T7 天赋字符串。',
+    });
+    state.ui.skillTreeTransferText.rows = 4;
+    state.ui.skillTreeTransferText.spellcheck = false;
+    state.ui.skillTreeTransferSummary = createElement('div', {
+      className: 'poe2-summary',
+      textContent: '导出读取服务器当前已保存的天赋；导入必须位于网页“天赋”页面，并只修改页面预览。',
+    });
+    const exportButton = createButton('导出已保存天赋', () => runTask('导出天赋', exportSkillTree));
+    exportButton.classList.add('poe2-success-button');
+    const copyButton = createButton('复制字符串', async () => {
+      try {
+        await copyTextToClipboard(state.ui.skillTreeTransferText.value.trim());
+        addLog('天赋字符串已复制到剪贴板。', 'compact');
+      } catch (error) {
+        addLog(`复制天赋字符串失败：${error.message}`, 'error');
+      }
+    });
+    const importButton = createButton('导入到当前天赋页', () => runTask('导入天赋', importSkillTreeToPage));
+    const clearButton = createButton('清空', () => {
+      state.ui.skillTreeTransferText.value = '';
+    });
+    state.ui.taskButtons?.push(exportButton, importButton);
+    return createElement('div', {
+      className: 'poe2-section',
+      children: [
+        createElement('div', {
+          className: 'poe2-section-title poe2-title-with-help',
+          children: [
+            createElement('span', { textContent: '天赋导入/导出' }),
+            createHelpTooltip('天赋导入/导出说明', [
+              '新格式用 T 加一位职业编号开头；职业起点不重复保存，节点按当前版本字典索引压缩，因此仅适用于同一天赋树版本。',
+              '导出成功后会写入下方文本框，并在浏览器允许时自动复制到剪贴板。',
+              '导入必须处于 /skilltree 天赋页面，会先检查职业、节点连通性、专精选项和可用天赋点。',
+              '导入只替换页面预览并刷新页面，不会直接调用 POST /api/skilltree。',
+              '确认页面显示无误后，需要由用户点击网页原生“保存”按钮提交。',
+            ]),
+          ],
+        }),
+        state.ui.skillTreeTransferSummary,
+        createLabeledControl('天赋字符串', state.ui.skillTreeTransferText, 'poe2-wide'),
+        createElement('div', {
+          className: 'poe2-actions poe2-affix-actions',
+          children: [exportButton, copyButton, importButton, clearButton],
+        }),
       ],
     });
   };
@@ -18353,7 +18732,7 @@
    * buildUserInterface 创建主按钮、主面板和所有控件。
    */
   const buildUserInterface = () => {
-    const toggleButton = createButton('助手 2.16', () => {
+    const toggleButton = createButton('助手 2.17', () => {
       state.isPanelVisible = !state.isPanelVisible;
       syncPanelVisibility();
     });
@@ -18377,7 +18756,7 @@
     const headerElement = createElement('div', {
       className: 'poe2-header',
       children: [
-        createElement('div', { className: 'poe2-title', textContent: '助手测试服版 2.16' }),
+        createElement('div', { className: 'poe2-title', textContent: '助手测试服版 2.17' }),
         collapseButton,
       ],
     });
@@ -19039,6 +19418,7 @@
         assistantBehaviorSection: createAssistantBehaviorSection(),
         equipmentUtilitySection: createEquipmentUtilitySection(),
         battleAnalysisSection: createBattleAnalysisSection(),
+        skillTreeTransferSection: createSkillTreeTransferSection(),
         rankAnalysisSection: createRankAnalysisSection(),
         safetyLimitSection: createSafetyLimitSection(),
         actionSection,
@@ -19067,10 +19447,25 @@
   const initialize = () => {
     installStyles();
     buildUserInterface();
-    addLog('助手 2.16 已加载。', 'compact');
+    addLog('助手 2.17 已加载。', 'compact');
+    try {
+      const importStatusText = sessionStorage.getItem(SKILL_TREE_IMPORT_STATUS_SESSION_KEY);
+      if (importStatusText) {
+        sessionStorage.removeItem(SKILL_TREE_IMPORT_STATUS_SESSION_KEY);
+        const importStatus = JSON.parse(importStatusText);
+        if (state.ui.skillTreeTransferSummary) state.ui.skillTreeTransferSummary.textContent = importStatus.message;
+        addLog(importStatus.message, importStatus.success ? 'success' : 'error');
+      }
+    } catch (error) {
+      console.warn('[AssistantV2] 读取天赋导入状态失败：', error);
+    }
   };
 
   AssistantV2.initialize = initialize;
-  AssistantV2.initialize();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', AssistantV2.initialize, { once: true });
+  } else {
+    AssistantV2.initialize();
+  }
 })();
 
