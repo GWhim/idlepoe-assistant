@@ -9701,7 +9701,7 @@
       if (payload.success === false) throw new Error(payload.message || '工艺改造失败');
     } catch (error) {
       if (!continueOnBackendRejection) throw error;
-      addLog(`${equipment.name} 存在多大师工艺，已尝试工艺但被后端拒绝：${error.message}；继续执行后续步骤。`, 'warn');
+      addLog(`${equipment.name} 工艺请求被后端拒绝：${error.message}；已进入可继续处理模式。`, 'warn');
       await wait(getSpeedDelay());
       return false;
     }
@@ -9744,7 +9744,7 @@
     return false;
   };
 
-  const applySmartCraftBench = async (equipment, craftId) => {
+  const applySmartCraftBench = async (equipment, craftId, { routeBackendRejection = false } = {}) => {
     await ensureCraftBenchList();
     const craft = getCraftBenchById(craftId);
     if (!craft) throw new Error('请先选择工艺词缀。');
@@ -9761,7 +9761,11 @@
       return true;
     }
     if (hasMultiMasterCraft) addStepLog(`${equipment.name} 存在多大师工艺，智能工艺强制尝试：${craft.label}。`);
-    const applied = await applyCraftBench(equipment, craftId, { continueOnBackendRejection: hasMultiMasterCraft });
+    const applied = await applyCraftBench(equipment, craftId, { continueOnBackendRejection: routeBackendRejection || hasMultiMasterCraft });
+    if (!applied && routeBackendRejection) {
+      addStepLog(`${equipment.name} 智能工艺请求未成功，进入失败处理。`);
+      return false;
+    }
     if (!applied && hasMultiMasterCraft) {
       addStepLog(`${equipment.name} 多大师智能工艺请求未成功，已忽略并继续。`);
       return true;
@@ -12581,10 +12585,10 @@
           labels.push(`步骤${formatContinuousStepCode(stepIndex)} 的下一步/条件成立跳转`);
         }
       }
-      if (step.action === 'conditionCheck' && step.failureHandling === 'jump') {
+      if (isContinuousFailureRoutableAction(step.action) && step.failureHandling === 'jump') {
         const targetIndex = resolveTarget(step.failureTargetStepIndex, stepIndex);
         if (targetIndex >= stepCount) {
-          labels.push(`步骤${formatContinuousStepCode(stepIndex)} 的条件不成立跳转`);
+          labels.push(`步骤${formatContinuousStepCode(stepIndex)} 的${getContinuousFailureBranchLabel(step.action)}跳转`);
         }
       }
     });
@@ -14421,13 +14425,12 @@
       return true;
     }
     if (normalizedStep.action === 'smartCraftBench') {
-      await applySmartCraftBench(equipment, normalizedStep.craftId);
-      return true;
+      return applySmartCraftBench(equipment, normalizedStep.craftId, { routeBackendRejection: true });
     }
     if (normalizedStep.action === 'craftBench') {
-      await applyCraftBench(equipment, normalizedStep.craftId);
-      addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 工艺完成。`);
-      return true;
+      const applied = await applyCraftBench(equipment, normalizedStep.craftId, { continueOnBackendRejection: true });
+      addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 工艺${applied ? '完成' : '失败，进入失败处理'}。`);
+      return applied;
     }
     if (normalizedStep.action === 'gardenCraft') {
       await applyGardenCraft(equipment, normalizedStep.gardenCraftCategory, normalizedStep.gardenCraftKey);
@@ -14460,18 +14463,29 @@
     CONTINUOUS_STEP_HANDLINGS[handling] ? handling : fallbackHandling
   );
 
+  const isContinuousFailureRoutableAction = (action) => (
+    action === 'conditionCheck' || action === 'craftBench' || action === 'smartCraftBench'
+  );
+
+  const getContinuousFailureBranchLabel = (action) => (
+    action === 'conditionCheck' ? '条件不成立' : '失败'
+  );
+
   const handleContinuousStepRouting = async (equipment, step, stepIndex, maxStepCount, resultType) => {
     const normalizedStep = normalizeContinuousCraftStep(step);
     const stepCode = formatContinuousStepCode(stepIndex);
     const isSuccess = resultType === 'success';
     const isConditionStep = normalizedStep.action === 'conditionCheck';
-    const handling = isConditionStep
-      ? (isSuccess ? normalizedStep.successHandling : normalizedStep.failureHandling)
+    const canRouteFailure = isContinuousFailureRoutableAction(normalizedStep.action);
+    const handling = !isSuccess && canRouteFailure
+      ? normalizedStep.failureHandling
       : normalizedStep.successHandling;
-    const targetStepIndex = isSuccess ? normalizedStep.successTargetStepIndex : normalizedStep.failureTargetStepIndex;
+    const targetStepIndex = !isSuccess && canRouteFailure
+      ? normalizedStep.failureTargetStepIndex
+      : normalizedStep.successTargetStepIndex;
     const statusText = isConditionStep
       ? (isSuccess ? '条件成立' : '条件不成立')
-      : (isSuccess ? '动作完成' : '动作未完成');
+      : (isSuccess ? '动作完成' : `${CONTINUOUS_CRAFT_ACTIONS[normalizedStep.action]?.label || '动作'}失败`);
     if (CONTINUOUS_STEP_TERMINATION_HANDLINGS[handling]) {
       const terminateConfig = CONTINUOUS_STEP_TERMINATION_HANDLINGS[handling];
       addLog(`${equipment.name} 自定义打造步骤 ${stepCode} ${statusText}，终止当前装备打造：${terminateConfig.label}。`, terminateConfig.level);
@@ -14480,7 +14494,7 @@
     if (handling === 'jump') {
       const nextStepIndex = resolveContinuousStepTarget(
         targetStepIndex,
-        isSuccess ? stepIndex + 1 : stepIndex,
+        isSuccess || !canRouteFailure ? stepIndex + 1 : stepIndex,
         maxStepCount,
       );
       const targetText = nextStepIndex >= maxStepCount ? '终止(打造成功)' : formatContinuousStepTarget(nextStepIndex);
@@ -14494,7 +14508,7 @@
 
   const getContinuousRoutingOutcomesForAnalysis = (step, stepIndex, maxStepCount) => {
     const normalizedStep = normalizeContinuousCraftStep(step);
-    const isConditionStep = normalizedStep.action === 'conditionCheck';
+    const canRouteFailure = isContinuousFailureRoutableAction(normalizedStep.action);
     const createTarget = (handling, targetStepIndex, fallbackStepIndex) => {
       if (handling === 'terminateSuccess') return [{ type: 'successExit' }];
       if (CONTINUOUS_STEP_TERMINATION_HANDLINGS[handling]) return [{ type: 'exit' }];
@@ -14502,7 +14516,7 @@
       const nextIndex = resolveContinuousStepTarget(targetStepIndex, fallbackStepIndex, maxStepCount);
       return nextIndex >= maxStepCount ? [{ type: 'complete' }] : [{ type: 'step', index: nextIndex }];
     };
-    if (!isConditionStep) {
+    if (!canRouteFailure) {
       return createTarget(normalizedStep.successHandling, normalizedStep.successTargetStepIndex, stepIndex + 1);
     }
     return [
@@ -14559,11 +14573,15 @@
     }
     normalizedSteps.forEach((step, stepIndex) => {
       const normalizedStep = normalizeContinuousCraftStep(step);
-      if (normalizedStep.action !== 'conditionCheck') return;
       const branches = [
-        { label: '条件成立', handling: normalizedStep.successHandling, targetStepIndex: normalizedStep.successTargetStepIndex, fallbackStepIndex: stepIndex + 1 },
-        { label: '条件不成立', handling: normalizedStep.failureHandling, targetStepIndex: normalizedStep.failureTargetStepIndex, fallbackStepIndex: stepIndex },
+        ...(normalizedStep.action === 'conditionCheck'
+          ? [{ label: '条件成立', handling: normalizedStep.successHandling, targetStepIndex: normalizedStep.successTargetStepIndex, fallbackStepIndex: stepIndex + 1 }]
+          : []),
+        ...(isContinuousFailureRoutableAction(normalizedStep.action)
+          ? [{ label: getContinuousFailureBranchLabel(normalizedStep.action), handling: normalizedStep.failureHandling, targetStepIndex: normalizedStep.failureTargetStepIndex, fallbackStepIndex: stepIndex }]
+          : []),
       ];
+      if (!branches.length) return;
       branches.forEach((branch) => {
         if (branch.handling !== 'jump') return;
         const targetIndex = resolveContinuousStepTarget(
@@ -17046,13 +17064,16 @@
   const updateContinuousHandlingTargetVisibility = () => {
     const currentAction = getActionFromContinuousActionControls();
     const isConditionAction = isContinuousConditionAction(currentAction);
+    const canRouteFailure = isContinuousFailureRoutableAction(currentAction);
     if (state.ui.continuousSuccessHandlingField) {
       state.ui.continuousSuccessHandlingField.hidden = false;
       const labelElement = state.ui.continuousSuccessHandlingField.querySelector('span');
       if (labelElement) labelElement.textContent = isConditionAction ? '条件成立' : '完成后';
     }
     if (state.ui.continuousFailureHandlingField) {
-      state.ui.continuousFailureHandlingField.hidden = !isConditionAction;
+      state.ui.continuousFailureHandlingField.hidden = !canRouteFailure;
+      const labelElement = state.ui.continuousFailureHandlingField.querySelector('span');
+      if (labelElement) labelElement.textContent = isConditionAction ? '条件不成立' : '失败后';
     }
     if (state.ui.continuousSuccessTargetField) {
       state.ui.continuousSuccessTargetField.hidden = state.ui.continuousSuccessSelect?.value !== 'jump';
@@ -17060,7 +17081,9 @@
       if (labelElement) labelElement.textContent = isConditionAction ? '成立跳转步骤' : '下一步';
     }
     if (state.ui.continuousFailureTargetField) {
-      state.ui.continuousFailureTargetField.hidden = !isConditionAction || state.ui.continuousFailureSelect?.value !== 'jump';
+      state.ui.continuousFailureTargetField.hidden = !canRouteFailure || state.ui.continuousFailureSelect?.value !== 'jump';
+      const labelElement = state.ui.continuousFailureTargetField.querySelector('span');
+      if (labelElement) labelElement.textContent = isConditionAction ? '不成立跳转步骤' : '失败跳转步骤';
     }
   };
 
@@ -17202,13 +17225,14 @@
       const craft = usesCraftBenchSelection ? getCraftBenchById(step.craftId) : null;
       const gardenCraft = usesGardenCraftSelection ? getGardenCraftByKey(step.gardenCraftCategory, step.gardenCraftKey) : null;
       const stepCode = formatContinuousStepCode(stepIndex);
+      const isConditionStep = step.action === 'conditionCheck';
+      const canRouteFailure = isContinuousFailureRoutableAction(step.action);
       const successText = step.successHandling === 'jump'
         ? `条件成立跳转步骤${formatContinuousStepEditableTargetLabel(step.successTargetStepIndex ?? stepIndex + 1, steps.length)}`
         : `条件成立${successConfig.label}`;
       const failureText = step.failureHandling === 'jump'
-        ? `条件不成立跳转步骤${formatContinuousStepEditableTargetLabel(step.failureTargetStepIndex, steps.length)}`
-        : `条件不成立${failureConfig.label}`;
-      const isConditionStep = step.action === 'conditionCheck';
+        ? `${getContinuousFailureBranchLabel(step.action)}跳转步骤${formatContinuousStepEditableTargetLabel(step.failureTargetStepIndex, steps.length)}`
+        : `${getContinuousFailureBranchLabel(step.action)}${failureConfig.label}`;
       const actionLabel = isConditionStep
         ? `${actionConfig.label}(${formatConditionStepShortLabel(effectiveGroups)})`
         : actionConfig.label;
@@ -17229,7 +17253,9 @@
       const summaryLines = [
         isConditionStep
           ? `步骤${stepCode} ${actionText} ${successText} ${failureText}`
-          : `步骤${stepCode} ${actionText} ${nextText}`,
+          : canRouteFailure
+            ? `步骤${stepCode} ${actionText} ${nextText} ${failureText}`
+            : `步骤${stepCode} ${actionText} ${nextText}`,
       ];
       const summaryText = summaryLines.filter(Boolean).join('\n');
       return createElement('div', {
@@ -19211,14 +19237,15 @@
               className: 'poe2-continuous-column',
               children: [
                 createElement('div', { className: 'poe2-section-title', textContent: '失败' }),
-                state.ui.continuousFailureHandlingField = createLabeledControl(createHelpedLabel('条件不成立', '条件不成立处理说明', [
-                  '这个设置只对“条件判断”步骤生效。',
-                  '跳转到步骤：条件不成立后跳到你选择的步骤。',
-                  '重铸后从步骤 A 开始：条件不成立后只使用一次重铸石，再从第一个步骤重新开始。破裂装备重铸后如果停在魔法，也会继续流程。',
+                state.ui.continuousFailureHandlingField = createLabeledControl(createHelpedLabel('条件不成立', '失败处理说明', [
+                  '这个设置对“条件判断”“工艺”“智能工艺”步骤生效。',
+                  '条件判断失败表示条件不成立；工艺失败表示工艺请求被后端拒绝。',
+                  '跳转到步骤：失败后跳到你选择的步骤。',
+                  '重铸后从步骤 A 开始：失败后只使用一次重铸石，再从第一个步骤重新开始。破裂装备重铸后如果停在魔法，也会继续流程。',
                   '终止(异常错误)：停止任务并显示错误。',
                   '终止(打造成功)：结束当前装备，并计为一次命中。',
                   '终止(手动操作)：结束当前装备，不计为命中。',
-                  '条件步骤不允许继续当前步骤；需要循环时请明确选择要跳回的步骤。',
+                  '失败分支不允许继续当前步骤；需要循环时请明确选择要跳回的步骤。',
                 ]), state.ui.continuousFailureSelect),
                 state.ui.continuousFailureTargetField = createLabeledControl('不成立跳转步骤', state.ui.continuousFailureTargetInput),
               ],
