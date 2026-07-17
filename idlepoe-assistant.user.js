@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         idlepoe 助手测试服版 2.17
+// @name         idlepoe 助手测试服版 2.18
 // @namespace    https://idlepoe.com
-// @version      2.17
+// @version      2.18
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @match        *://poe-test.faith.wang/*
 // @grant        GM_addStyle
@@ -422,7 +422,6 @@
     rarity: { label: '装备稀有度', valueType: 'rarity' },
     corrupted: { label: '是否已腐化', valueType: 'boolean' },
     crafted: { label: '是否有工艺词缀', valueType: 'boolean' },
-    craftedMultimod: { label: '是否有工艺多大师', valueType: 'boolean' },
     openPrefix: { label: '是否有空前缀', valueType: 'boolean' },
     openSuffix: { label: '是否有空后缀', valueType: 'boolean' },
     openAffix: { label: '是否有空词缀', valueType: 'boolean' },
@@ -2397,7 +2396,7 @@
                   { "name": "额外物理伤害减免", "maxLevel": 5 }
               ]
           },
-          "胸甲(dex))": {
+          "胸甲(dex)": {
               "前缀": [
                   { "name": "最大生命", "maxLevel": 13 },
                   { "name": "该装备的闪避值提高", "maxLevel": 8 },
@@ -6238,7 +6237,6 @@
     'openSuffix',
     'openAffix',
     'crafted',
-    'craftedMultimod',
   ]);
 
   const SHARE_ROLL_METRIC_ENUM = createShareEnum([
@@ -6580,6 +6578,7 @@
     /** craftBench 保存工艺台列表缓存，来自游戏前端同款 /craft/list 接口。 */
     craftBench: {
       list: [],
+      affixPickerByEquipment: {},
       loaded: false,
       loading: false,
       loadingPromise: null,
@@ -9395,13 +9394,27 @@
     if (state.craftBench.magicFormattersLoadingPromise) return state.craftBench.magicFormattersLoadingPromise;
     state.craftBench.magicFormattersLoadingPromise = (async () => {
       const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-      const battleScript = [...document.scripts]
-        .map((script) => script.src || '')
-        .find((src) => /\/assets\/battle-[^/]+\.js/.test(src));
-      const battleScriptUrl = battleScript || `${location.origin}/assets/battle-CuuYzQen.js`;
-      const sourceText = await fetch(battleScriptUrl).then((response) => response.ok ? response.text() : '');
+      // 网页入口模块会把完整 magic 渲染表挂到 window.magics。脚本在
+      // DOMContentLoaded 后初始化时应优先复用它，避免重新解析资源时先把
+      // 工艺标签缓存成“属性 ID + 数值”。
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const pageFormatters = pageWindow.magics || pageWindow.bt;
+        if (pageFormatters && typeof pageFormatters === 'object') {
+          state.craftBench.magicFormatters = pageFormatters;
+          return pageFormatters;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      }
+
+      const battleAssetUrl = [...document.querySelectorAll('script[src], link[href]')]
+        .map((element) => element.src || element.href || '')
+        .find((url) => /\/assets\/battle-[^/]+\.js(?:[?#].*)?$/.test(url));
+      if (!battleAssetUrl) throw new Error('当前页面未发现 battle 属性名称资源');
+      const response = await fetch(battleAssetUrl);
+      if (!response.ok) throw new Error(`battle 属性名称资源读取失败（HTTP ${response.status}）`);
+      const sourceText = await response.text();
       const objectLiteral = extractObjectLiteralByPrefix(sourceText, 'bt=');
-      if (!objectLiteral) return null;
+      if (!objectLiteral) throw new Error('battle 属性名称表结构无法识别');
       const helpers = createCraftMagicFormatterHelpers();
       const formatters = Function(
         'nt',
@@ -9481,7 +9494,8 @@
   });
 
   const fetchCraftBenchList = async () => {
-    await installCraftMagicFormattersFromBattleAsset();
+    const magicFormatters = await installCraftMagicFormattersFromBattleAsset();
+    if (!magicFormatters) throw new Error('工艺属性名称表未就绪，已取消追加以避免显示属性编号');
     const payload = await requestJson(`${config.endpoints.craftList}?_=${Date.now()}`);
     if (payload.success === false) throw new Error(payload.message || '工艺列表读取失败');
     const craftList = Array.isArray(payload.data) ? payload.data : [];
@@ -9489,6 +9503,7 @@
       .filter((craft) => craft?.affix || Number(craft?.craftId) === 0)
       .map(normalizeCraftBenchItem)
       .sort((left, right) => left.label.localeCompare(right.label) || left.craftId - right.craftId);
+    state.craftBench.affixPickerByEquipment = buildCraftAffixPickerOverlay();
     state.craftBench.loaded = true;
     return state.craftBench.list;
   };
@@ -9701,7 +9716,7 @@
       if (payload.success === false) throw new Error(payload.message || '工艺改造失败');
     } catch (error) {
       if (!continueOnBackendRejection) throw error;
-      addLog(`${equipment.name} 工艺请求被后端拒绝：${error.message}；已进入可继续处理模式。`, 'warn');
+      addLog(`${equipment.name} 存在多大师工艺，已尝试工艺但被后端拒绝：${error.message}；继续执行后续步骤。`, 'warn');
       await wait(getSpeedDelay());
       return false;
     }
@@ -9718,14 +9733,7 @@
     .some((affix) => affix?.isCrafted === true);
 
   const hasMultiMasterCraftAffix = (equipment) => (Array.isArray(equipment?.affixes) ? equipment.affixes : [])
-    .some((affix) => (
-      Object.prototype.hasOwnProperty.call(affix?.magics || {}, '552')
-      || (
-        affix?.isCrafted === true
-        && normalizeAffixPositionType(affix) === 'suffix'
-        && String(affix?.name || affix?.affixName || '').trim() === '大师之'
-      )
-    ));
+    .some((affix) => Object.prototype.hasOwnProperty.call(affix?.magics || {}, '552'));
 
   const getCraftBenchPositionType = (craft) => {
     const affixType = Number(craft?.affix?.type || 0);
@@ -9744,7 +9752,7 @@
     return false;
   };
 
-  const applySmartCraftBench = async (equipment, craftId, { routeBackendRejection = false } = {}) => {
+  const applySmartCraftBench = async (equipment, craftId) => {
     await ensureCraftBenchList();
     const craft = getCraftBenchById(craftId);
     if (!craft) throw new Error('请先选择工艺词缀。');
@@ -9761,11 +9769,7 @@
       return true;
     }
     if (hasMultiMasterCraft) addStepLog(`${equipment.name} 存在多大师工艺，智能工艺强制尝试：${craft.label}。`);
-    const applied = await applyCraftBench(equipment, craftId, { continueOnBackendRejection: routeBackendRejection || hasMultiMasterCraft });
-    if (!applied && routeBackendRejection) {
-      addStepLog(`${equipment.name} 智能工艺请求未成功，进入失败处理。`);
-      return false;
-    }
+    const applied = await applyCraftBench(equipment, craftId, { continueOnBackendRejection: hasMultiMasterCraft });
     if (!applied && hasMultiMasterCraft) {
       addStepLog(`${equipment.name} 多大师智能工艺请求未成功，已忽略并继续。`);
       return true;
@@ -10941,9 +10945,10 @@
         kind: 'affix',
         name: String(condition.name || '').trim(),
         affixType: String(condition.affixType || condition.typeName || '').trim(),
+        craftId: Number.isInteger(Number(condition.craftId)) && Number(condition.craftId) > 0 ? Number(condition.craftId) : null,
       };
     }
-    return { kind: 'affix', name: String(condition || '').trim(), affixType: '' };
+    return { kind: 'affix', name: String(condition || '').trim(), affixType: '', craftId: null };
   };
 
   /**
@@ -10960,7 +10965,7 @@
     if (isRollCondition(normalizedCondition)) {
       return `roll\u0001${normalizedCondition.metric}\u0001${normalizedCondition.operator}\u0001${normalizedCondition.value}`;
     }
-    return `affix\u0001${normalizedCondition.affixType}\u0001${normalizedCondition.name}`;
+    return `affix\u0001${normalizedCondition.affixType}\u0001${normalizedCondition.name}\u0001${normalizedCondition.craftId || ''}`;
   };
 
   /**
@@ -10985,6 +10990,10 @@
       const valueLabel = metricConfig?.valueType === 'percent' ? `${normalizedCondition.value}%` : normalizedCondition.value;
       return `词缀Roll：${metricConfig?.label || normalizedCondition.metric} ${operatorLabel} ${valueLabel}`;
     }
+    if (normalizedCondition.craftId) {
+      const craft = getCraftBenchById(normalizedCondition.craftId);
+      return `工艺词缀：${craft?.label || normalizedCondition.name}`;
+    }
     if (!normalizedCondition.affixType) return normalizedCondition.name;
     return `${normalizedCondition.affixType}：${normalizedCondition.name}`;
   };
@@ -10996,7 +11005,6 @@
     rarity: '稀有',
     corrupted: '腐化',
     crafted: '工艺',
-    craftedMultimod: '多大师',
     openPrefix: '空前',
     openSuffix: '空后',
     openAffix: '空词',
@@ -11385,8 +11393,18 @@
    */
   const getAffixConditionPossibleTypes = (condition) => (
     isSpecialCondition(condition) || isRollCondition(condition) ? [] :
+    condition.craftId ? [`工艺词缀:${condition.craftId}`] :
     condition.affixType ? [condition.affixType] : getAffixPossibleTypes(condition.name)
   );
+
+  const getAffixConditionPossiblePositions = (condition) => {
+    if (condition?.craftId) {
+      const craftAffixType = Number(getCraftBenchById(condition.craftId)?.affix?.type || 0);
+      if (craftAffixType === 1) return ['prefix'];
+      if (craftAffixType === 2) return ['suffix'];
+    }
+    return getAffixPossiblePositions(condition?.name);
+  };
 
   /**
    * isAffixGroupPossible 判断某个条件组在指定前后缀上限下是否存在可实现的命中组合。
@@ -11416,7 +11434,7 @@
       for (const [stateKey, usedTypes] of states.entries()) {
         const [countKey] = stateKey.split('|');
         const [pickedCount, prefixCount, suffixCount] = countKey.split(',').map(Number);
-        for (const position of getAffixPossiblePositions(condition.name)) {
+        for (const position of getAffixConditionPossiblePositions(condition)) {
           for (const affixTypeName of getAffixConditionPossibleTypes(condition)) {
             if (usedTypes.has(affixTypeName)) continue;
             const nextPrefixCount = prefixCount + (position === 'prefix' ? 1 : 0);
@@ -11952,6 +11970,35 @@
       .filter((candidate) => candidate.ranges.length);
   };
 
+  const doesEquipmentAffixMatchCraft = (equipment, affix, craft) => {
+    const craftAffix = craft?.affix;
+    if (!craftAffix || affix?.isCrafted !== true) return false;
+    if (Number(craftAffix.type || 0) !== Number(affix?.type || 0)) return false;
+    const equipmentMask = parseEquipmentTypeMask(equipment?.equipmentType);
+    if (equipmentMask && !isCraftBenchForMask(craft, equipmentMask)) return false;
+    const craftMagicIds = Object.keys(craftAffix.magics || {}).map(String);
+    const affixMagicIds = getAffixMagicIds(affix);
+    if (!craftMagicIds.length || !craftMagicIds.every((magicId) => affixMagicIds.has(magicId))) return false;
+    const ranges = parseCraftBenchRollRanges(craftAffix);
+    if (!ranges.length) return true;
+    const actualValues = craftMagicIds.flatMap((magicId) => flattenMagicValueMap(affix?.magics?.[magicId]));
+    if (!actualValues.length) return false;
+    const candidate = {
+      affixTypeName: CRAFT_AFFIX_TYPE_NAME,
+      effectValue: String(craft.label || formatCraftBenchLabel(craft) || ''),
+    };
+    return getAffixMagnitudeMultiplierCandidates(equipment, affix, candidate)
+      .some((magnitudeMultiplier) => Boolean(matchAffixRollRangesToActualValues(ranges, actualValues, magnitudeMultiplier)));
+  };
+
+  const isCraftAffixConditionMatched = (equipment, condition) => {
+    if (!condition?.craftId) return false;
+    const craft = getCraftBenchById(condition.craftId);
+    if (!craft) return false;
+    return (Array.isArray(equipment?.affixes) ? equipment.affixes : [])
+      .some((affix) => doesEquipmentAffixMatchCraft(equipment, affix, craft));
+  };
+
   const calculateAffixRollPercentages = (equipment, affix) => {
     const affixName = String(affix?.name || affix?.affixName || '').trim() || '未知词缀';
     const actualValues = flattenAffixMagicValues(affix);
@@ -12025,7 +12072,6 @@
     if (metric === 'rarity') return Number(equipment?.rarity || RARITY_TYPES.normal);
     if (metric === 'corrupted') return Boolean(equipment?.corrupted);
     if (metric === 'crafted') return hasCraftedAffix(equipment);
-    if (metric === 'craftedMultimod') return hasMultiMasterCraftAffix(equipment);
     if (metric === 'openPrefix') return affixSummary.prefixCount < affixSlotLimits.prefix;
     if (metric === 'openSuffix') return affixSummary.suffixCount < affixSlotLimits.suffix;
     if (metric === 'openAffix') {
@@ -12053,6 +12099,7 @@
         normalizedCondition.value,
       );
     }
+    if (normalizedCondition.craftId) return isCraftAffixConditionMatched(equipment, normalizedCondition);
     return affixNames.includes(normalizedCondition.name);
   };
 
@@ -12099,27 +12146,6 @@
     }
     summary.totalCount = summary.prefixCount + summary.suffixCount;
     return summary;
-  };
-
-  const formatCraftSnapshotAffix = (affix) => {
-    const tierNumber = getAffixTierNumber(affix);
-    const tierText = tierNumber ? `T${tierNumber} ` : '';
-    const craftedText = affix?.isCrafted === true ? '工艺 ' : '';
-    const nameText = affix?.name || affix?.affixName || '未知词缀';
-    const effectText = getAffixEffectText(affix);
-    return `${craftedText}${tierText}${nameText}${effectText ? `：${effectText}` : ''}`;
-  };
-
-  const formatEquipmentAffixSnapshot = (equipment) => {
-    const affixes = Array.isArray(equipment?.affixes) ? equipment.affixes : [];
-    return affixes.length ? affixes.map((affix) => {
-      const positionText = formatAffixPositionName(affix?.type);
-      return `${positionText} ${formatCraftSnapshotAffix(affix)}`;
-    }).join('；') : '无';
-  };
-
-  const logContinuousCraftAffixSnapshot = (equipment, stepIndex, actionLabel) => {
-    addMainLog(`${equipment.name} 步骤 ${formatContinuousStepCode(stepIndex)} ${actionLabel}后，当前词缀：${formatEquipmentAffixSnapshot(equipment)}。`);
   };
 
   /**
@@ -12323,7 +12349,8 @@
     (Array.isArray(conditionGroups) ? conditionGroups : []).some((group) => (
       (Array.isArray(group?.conditions) ? group.conditions : []).some((condition) => {
         const normalizedCondition = normalizeAffixCondition(condition);
-        return isRollCondition(normalizedCondition) && Boolean(AFFIX_ROLL_METRIC_SOURCES[normalizedCondition.metric]);
+        return Boolean(normalizedCondition.craftId)
+          || (isRollCondition(normalizedCondition) && Boolean(AFFIX_ROLL_METRIC_SOURCES[normalizedCondition.metric]));
       })
     ))
   );
@@ -12334,7 +12361,7 @@
     ))
   );
 
-  const ensureCraftBenchListForRollConditions = async (options) => {
+  const ensureCraftBenchListForConditions = async (options) => {
     const needsCraftBenchList = conditionGroupsNeedCraftBenchRollRanges(options?.affixConditionGroups)
       || continuousStepsNeedCraftBenchRollRanges(options?.continuousCraftSteps);
     if (!needsCraftBenchList) return;
@@ -12502,6 +12529,7 @@
       ];
     }
     const normalizedCondition = normalizeAffixCondition(condition);
+    if (normalizedCondition.craftId) return [normalizedCondition.name, normalizedCondition.affixType || '工艺词缀', normalizedCondition.craftId];
     const affixId = getAffixConditionId(normalizedCondition);
     if (affixId) return affixId;
     return normalizedCondition.affixType ? [normalizedCondition.name, normalizedCondition.affixType] : normalizedCondition.name;
@@ -12537,7 +12565,11 @@
           value: compactCondition[3],
         });
       }
-      return normalizeAffixCondition({ name: compactCondition[0], affixType: compactCondition[1] });
+      return normalizeAffixCondition({
+        name: compactCondition[0],
+        affixType: compactCondition[1],
+        craftId: compactCondition[2],
+      });
     }
     return normalizeAffixCondition(compactCondition);
   };
@@ -12585,10 +12617,10 @@
           labels.push(`步骤${formatContinuousStepCode(stepIndex)} 的下一步/条件成立跳转`);
         }
       }
-      if (isContinuousFailureRoutableAction(step.action) && step.failureHandling === 'jump') {
+      if (step.action === 'conditionCheck' && step.failureHandling === 'jump') {
         const targetIndex = resolveTarget(step.failureTargetStepIndex, stepIndex);
         if (targetIndex >= stepCount) {
-          labels.push(`步骤${formatContinuousStepCode(stepIndex)} 的${getContinuousFailureBranchLabel(step.action)}跳转`);
+          labels.push(`步骤${formatContinuousStepCode(stepIndex)} 的条件不成立跳转`);
         }
       }
     });
@@ -14425,12 +14457,13 @@
       return true;
     }
     if (normalizedStep.action === 'smartCraftBench') {
-      return applySmartCraftBench(equipment, normalizedStep.craftId, { routeBackendRejection: true });
+      await applySmartCraftBench(equipment, normalizedStep.craftId);
+      return true;
     }
     if (normalizedStep.action === 'craftBench') {
-      const applied = await applyCraftBench(equipment, normalizedStep.craftId, { continueOnBackendRejection: true });
-      addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 工艺${applied ? '完成' : '失败，进入失败处理'}。`);
-      return applied;
+      await applyCraftBench(equipment, normalizedStep.craftId);
+      addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 工艺完成。`);
+      return true;
     }
     if (normalizedStep.action === 'gardenCraft') {
       await applyGardenCraft(equipment, normalizedStep.gardenCraftCategory, normalizedStep.gardenCraftKey);
@@ -14463,29 +14496,18 @@
     CONTINUOUS_STEP_HANDLINGS[handling] ? handling : fallbackHandling
   );
 
-  const isContinuousFailureRoutableAction = (action) => (
-    action === 'conditionCheck' || action === 'craftBench' || action === 'smartCraftBench'
-  );
-
-  const getContinuousFailureBranchLabel = (action) => (
-    action === 'conditionCheck' ? '条件不成立' : '失败'
-  );
-
   const handleContinuousStepRouting = async (equipment, step, stepIndex, maxStepCount, resultType) => {
     const normalizedStep = normalizeContinuousCraftStep(step);
     const stepCode = formatContinuousStepCode(stepIndex);
     const isSuccess = resultType === 'success';
     const isConditionStep = normalizedStep.action === 'conditionCheck';
-    const canRouteFailure = isContinuousFailureRoutableAction(normalizedStep.action);
-    const handling = !isSuccess && canRouteFailure
-      ? normalizedStep.failureHandling
+    const handling = isConditionStep
+      ? (isSuccess ? normalizedStep.successHandling : normalizedStep.failureHandling)
       : normalizedStep.successHandling;
-    const targetStepIndex = !isSuccess && canRouteFailure
-      ? normalizedStep.failureTargetStepIndex
-      : normalizedStep.successTargetStepIndex;
+    const targetStepIndex = isSuccess ? normalizedStep.successTargetStepIndex : normalizedStep.failureTargetStepIndex;
     const statusText = isConditionStep
       ? (isSuccess ? '条件成立' : '条件不成立')
-      : (isSuccess ? '动作完成' : `${CONTINUOUS_CRAFT_ACTIONS[normalizedStep.action]?.label || '动作'}失败`);
+      : (isSuccess ? '动作完成' : '动作未完成');
     if (CONTINUOUS_STEP_TERMINATION_HANDLINGS[handling]) {
       const terminateConfig = CONTINUOUS_STEP_TERMINATION_HANDLINGS[handling];
       addLog(`${equipment.name} 自定义打造步骤 ${stepCode} ${statusText}，终止当前装备打造：${terminateConfig.label}。`, terminateConfig.level);
@@ -14494,7 +14516,7 @@
     if (handling === 'jump') {
       const nextStepIndex = resolveContinuousStepTarget(
         targetStepIndex,
-        isSuccess || !canRouteFailure ? stepIndex + 1 : stepIndex,
+        isSuccess ? stepIndex + 1 : stepIndex,
         maxStepCount,
       );
       const targetText = nextStepIndex >= maxStepCount ? '终止(打造成功)' : formatContinuousStepTarget(nextStepIndex);
@@ -14508,7 +14530,7 @@
 
   const getContinuousRoutingOutcomesForAnalysis = (step, stepIndex, maxStepCount) => {
     const normalizedStep = normalizeContinuousCraftStep(step);
-    const canRouteFailure = isContinuousFailureRoutableAction(normalizedStep.action);
+    const isConditionStep = normalizedStep.action === 'conditionCheck';
     const createTarget = (handling, targetStepIndex, fallbackStepIndex) => {
       if (handling === 'terminateSuccess') return [{ type: 'successExit' }];
       if (CONTINUOUS_STEP_TERMINATION_HANDLINGS[handling]) return [{ type: 'exit' }];
@@ -14516,7 +14538,7 @@
       const nextIndex = resolveContinuousStepTarget(targetStepIndex, fallbackStepIndex, maxStepCount);
       return nextIndex >= maxStepCount ? [{ type: 'complete' }] : [{ type: 'step', index: nextIndex }];
     };
-    if (!canRouteFailure) {
+    if (!isConditionStep) {
       return createTarget(normalizedStep.successHandling, normalizedStep.successTargetStepIndex, stepIndex + 1);
     }
     return [
@@ -14573,15 +14595,11 @@
     }
     normalizedSteps.forEach((step, stepIndex) => {
       const normalizedStep = normalizeContinuousCraftStep(step);
+      if (normalizedStep.action !== 'conditionCheck') return;
       const branches = [
-        ...(normalizedStep.action === 'conditionCheck'
-          ? [{ label: '条件成立', handling: normalizedStep.successHandling, targetStepIndex: normalizedStep.successTargetStepIndex, fallbackStepIndex: stepIndex + 1 }]
-          : []),
-        ...(isContinuousFailureRoutableAction(normalizedStep.action)
-          ? [{ label: getContinuousFailureBranchLabel(normalizedStep.action), handling: normalizedStep.failureHandling, targetStepIndex: normalizedStep.failureTargetStepIndex, fallbackStepIndex: stepIndex }]
-          : []),
+        { label: '条件成立', handling: normalizedStep.successHandling, targetStepIndex: normalizedStep.successTargetStepIndex, fallbackStepIndex: stepIndex + 1 },
+        { label: '条件不成立', handling: normalizedStep.failureHandling, targetStepIndex: normalizedStep.failureTargetStepIndex, fallbackStepIndex: stepIndex },
       ];
-      if (!branches.length) return;
       branches.forEach((branch) => {
         if (branch.handling !== 'jump') return;
         const targetIndex = resolveContinuousStepTarget(
@@ -14657,14 +14675,6 @@
         }
       }
       const stepMatched = await executeContinuousCraftStep(equipment, normalizedSteps[stepIndex], stepIndex);
-      const currentStep = normalizedSteps[stepIndex];
-      if (stepMatched && ['annulment', 'exalted'].includes(currentStep.action)) {
-        logContinuousCraftAffixSnapshot(
-          equipment,
-          stepIndex,
-          CONTINUOUS_CRAFT_ACTIONS[currentStep.action]?.label || currentStep.action,
-        );
-      }
       const previousStepIndex = stepIndex;
       if (stepMatched) {
         stepIndex = await handleContinuousStepRouting(equipment, normalizedSteps[stepIndex], stepIndex, normalizedSteps.length, 'success');
@@ -15203,15 +15213,21 @@
    * @returns {Array<string>} 去重后的技能石 ID 列表。
    */
   const getSelectedSkillStoneIds = () => {
-    const ids = Array.from(state.ui.skillStoneSelect?.selectedOptions || [])
+    const nativeIds = Array.from(state.ui.skillStoneSelect?.selectedOptions || [])
       .map((option) => option.value)
       .filter(Boolean);
+    const visualIds = Array.from(state.ui.skillStoneVisualList?.querySelectorAll('.poe2-stone-choice input[type="checkbox"]:checked') || [])
+      .map((checkbox) => checkbox.closest('.poe2-stone-choice')?.dataset.stoneId)
+      .filter(Boolean);
+    const ids = visualIds.length ? visualIds : nativeIds;
     return [...new Set(ids)];
   };
 
   const syncSkillStoneVisualSelectionFromNative = () => {
     if (!state.ui.skillStoneVisualList) return;
-    const selectedIds = new Set(getSelectedSkillStoneIds());
+    const selectedIds = new Set(Array.from(state.ui.skillStoneSelect?.selectedOptions || [])
+      .map((option) => option.value)
+      .filter(Boolean));
     state.ui.skillStoneVisualList.querySelectorAll('.poe2-stone-choice').forEach((rowElement) => {
       const selected = selectedIds.has(rowElement.dataset.stoneId);
       const checkboxElement = rowElement.querySelector('input[type="checkbox"]');
@@ -16335,13 +16351,13 @@
 
   /**
    * togglePositionAdjustMode 切换外部悬浮入口按钮的调位模式。
-   * 调位模式开启后可拖动“助手 2.17”按钮；再次点击关闭并保留当前位置。
+   * 调位模式开启后可拖动“助手 2.18”按钮；再次点击关闭并保留当前位置。
    */
   const togglePositionAdjustMode = () => {
     state.isTogglePositionMode = !state.isTogglePositionMode;
     state.ui.toggleButton?.classList.toggle('poe2-toggle-positioning', state.isTogglePositionMode);
     if (state.isTogglePositionMode) {
-      addLog('已开启调整位置模式：拖动外部“助手 2.17”按钮即可改变入口位置，再次点击“调整位置”关闭。', 'compact');
+      addLog('已开启调整位置模式：拖动外部“助手 2.18”按钮即可改变入口位置，再次点击“调整位置”关闭。', 'compact');
     } else {
       addLog('已关闭调整位置模式，外部入口按钮位置已保存。', 'compact');
     }
@@ -16647,6 +16663,65 @@
   const getAffixPositionOptions = (equipmentType) => Object.keys(AFFIX_EQUIPMENT_DATA[equipmentType] || {})
     .map((positionName) => ({ value: positionName, label: positionName }));
 
+  const CRAFT_AFFIX_TYPE_NAME = '工艺词缀';
+
+  const AFFIX_PICKER_EQUIPMENT_MASKS = {
+    单手剑: 1n,
+    单手斧: 2n,
+    法杖: 4n,
+    爪: 8n,
+    匕首: 16n,
+    细剑: 32n,
+    单手锤: 64n,
+    短杖: 128n,
+    符文匕首: 256n,
+    弓: EQUIPMENT_TYPE_MASKS.bows,
+    长杖: 1024n,
+    双手剑: 2048n,
+    双手斧: 4096n,
+    双手锤: 8192n,
+    战杖: 16384n,
+    箭袋: EQUIPMENT_TYPE_MASKS.quivers,
+    头部: EQUIPMENT_TYPE_MASKS.helmets,
+    头盔: EQUIPMENT_TYPE_MASKS.helmets,
+    胸甲: EQUIPMENT_TYPE_MASKS.bodyArmours,
+    手套: EQUIPMENT_TYPE_MASKS.gloves,
+    鞋子: EQUIPMENT_TYPE_MASKS.boots,
+    靴子: EQUIPMENT_TYPE_MASKS.boots,
+    盾牌: EQUIPMENT_TYPE_MASKS.shields,
+    腰带: EQUIPMENT_TYPE_MASKS.belts,
+    项链: EQUIPMENT_TYPE_MASKS.amulets,
+    戒指: EQUIPMENT_TYPE_MASKS.rings,
+  };
+
+  const getAffixPickerEquipmentMask = (equipmentType) => {
+    const baseType = String(equipmentType || '').replace(/\(.*/, '');
+    return AFFIX_PICKER_EQUIPMENT_MASKS[baseType] || 0n;
+  };
+
+  const filterCraftBenchAffixesForPicker = (equipmentType, affixPosition) => {
+    const equipmentMask = getAffixPickerEquipmentMask(equipmentType);
+    const affixType = String(affixPosition || '').includes('前') ? 1 : String(affixPosition || '').includes('后') ? 2 : 0;
+    if (!equipmentMask || !affixType) return [];
+    return (Array.isArray(state.craftBench?.list) ? state.craftBench.list : [])
+      .filter((craft) => craft?.affix && Number(craft.affix.type || 0) === affixType)
+      .filter((craft) => isCraftBenchForMask(craft, equipmentMask));
+  };
+
+  const buildCraftAffixPickerOverlay = () => Object.fromEntries(
+    Object.entries(AFFIX_EQUIPMENT_DATA).map(([equipmentType, positionData]) => [
+      equipmentType,
+      Object.fromEntries(Object.keys(positionData || {}).map((affixPosition) => [
+        affixPosition,
+        filterCraftBenchAffixesForPicker(equipmentType, affixPosition),
+      ])),
+    ]),
+  );
+
+  const getCraftBenchAffixesForPicker = (equipmentType, affixPosition) => (
+    state.craftBench?.affixPickerByEquipment?.[equipmentType]?.[affixPosition] || []
+  );
+
   /**
    * getAffixTypeOptions 根据装备类型和词缀位置返回可选词缀类型。
    * @param {string} equipmentType 装备类型。
@@ -16656,13 +16731,17 @@
   const getAffixTypeOptions = (equipmentType, affixPosition) => {
     const affixes = AFFIX_EQUIPMENT_DATA[equipmentType]?.[affixPosition];
     if (!Array.isArray(affixes)) return [];
-    return affixes
+    const options = affixes
       .filter((affix) => affix?.name)
       .map((affix) => ({
         value: affix.name,
         label: affix.name,
         meta: { maxLevel: Number(affix.maxLevel || 0) },
       }));
+    if (getCraftBenchAffixesForPicker(equipmentType, affixPosition).length) {
+      options.push({ value: CRAFT_AFFIX_TYPE_NAME, label: CRAFT_AFFIX_TYPE_NAME, meta: { maxLevel: 0, crafted: true } });
+    }
+    return options;
   };
 
   const getAffixTierSortWeight = (affixTypeName, tier) => {
@@ -16691,7 +16770,14 @@
    * @param {number} maxLevel 当前装备类型允许的最高阶级。
    * @returns {Array<object>} 具体词缀等级下拉选项。
    */
-  const getAffixTierOptions = (affixTypeName, maxLevel) => {
+  const getAffixTierOptions = (affixTypeName, maxLevel, equipmentType = '', affixPosition = '') => {
+    if (affixTypeName === CRAFT_AFFIX_TYPE_NAME) {
+      return getCraftBenchAffixesForPicker(equipmentType, affixPosition).map((craft) => ({
+        value: String(craft.label || craft.affix?.name || `工艺 ${craft.craftId}`),
+        label: craft.label,
+        meta: { affixType: CRAFT_AFFIX_TYPE_NAME, craftId: craft.craftId, crafted: true },
+      }));
+    }
     const tierList = AFFIX_LEVEL_DATA[affixTypeName];
     if (!Array.isArray(tierList)) return [];
     const filteredTierList = [...tierList].filter((tier) => Number(tier?.level || 0) <= maxLevel);
@@ -16872,6 +16958,7 @@
           return normalizeAffixCondition({
             name: option.value,
             affixType: option.dataset?.affixType || selectedAffixType,
+            craftId: option.dataset?.craftId,
           });
         }
         return normalizeAffixCondition({ name: option, affixType: selectedAffixType });
@@ -17064,16 +17151,13 @@
   const updateContinuousHandlingTargetVisibility = () => {
     const currentAction = getActionFromContinuousActionControls();
     const isConditionAction = isContinuousConditionAction(currentAction);
-    const canRouteFailure = isContinuousFailureRoutableAction(currentAction);
     if (state.ui.continuousSuccessHandlingField) {
       state.ui.continuousSuccessHandlingField.hidden = false;
       const labelElement = state.ui.continuousSuccessHandlingField.querySelector('span');
       if (labelElement) labelElement.textContent = isConditionAction ? '条件成立' : '完成后';
     }
     if (state.ui.continuousFailureHandlingField) {
-      state.ui.continuousFailureHandlingField.hidden = !canRouteFailure;
-      const labelElement = state.ui.continuousFailureHandlingField.querySelector('span');
-      if (labelElement) labelElement.textContent = isConditionAction ? '条件不成立' : '失败后';
+      state.ui.continuousFailureHandlingField.hidden = !isConditionAction;
     }
     if (state.ui.continuousSuccessTargetField) {
       state.ui.continuousSuccessTargetField.hidden = state.ui.continuousSuccessSelect?.value !== 'jump';
@@ -17081,9 +17165,7 @@
       if (labelElement) labelElement.textContent = isConditionAction ? '成立跳转步骤' : '下一步';
     }
     if (state.ui.continuousFailureTargetField) {
-      state.ui.continuousFailureTargetField.hidden = !canRouteFailure || state.ui.continuousFailureSelect?.value !== 'jump';
-      const labelElement = state.ui.continuousFailureTargetField.querySelector('span');
-      if (labelElement) labelElement.textContent = isConditionAction ? '不成立跳转步骤' : '失败跳转步骤';
+      state.ui.continuousFailureTargetField.hidden = !isConditionAction || state.ui.continuousFailureSelect?.value !== 'jump';
     }
   };
 
@@ -17225,14 +17307,13 @@
       const craft = usesCraftBenchSelection ? getCraftBenchById(step.craftId) : null;
       const gardenCraft = usesGardenCraftSelection ? getGardenCraftByKey(step.gardenCraftCategory, step.gardenCraftKey) : null;
       const stepCode = formatContinuousStepCode(stepIndex);
-      const isConditionStep = step.action === 'conditionCheck';
-      const canRouteFailure = isContinuousFailureRoutableAction(step.action);
       const successText = step.successHandling === 'jump'
         ? `条件成立跳转步骤${formatContinuousStepEditableTargetLabel(step.successTargetStepIndex ?? stepIndex + 1, steps.length)}`
         : `条件成立${successConfig.label}`;
       const failureText = step.failureHandling === 'jump'
-        ? `${getContinuousFailureBranchLabel(step.action)}跳转步骤${formatContinuousStepEditableTargetLabel(step.failureTargetStepIndex, steps.length)}`
-        : `${getContinuousFailureBranchLabel(step.action)}${failureConfig.label}`;
+        ? `条件不成立跳转步骤${formatContinuousStepEditableTargetLabel(step.failureTargetStepIndex, steps.length)}`
+        : `条件不成立${failureConfig.label}`;
+      const isConditionStep = step.action === 'conditionCheck';
       const actionLabel = isConditionStep
         ? `${actionConfig.label}(${formatConditionStepShortLabel(effectiveGroups)})`
         : actionConfig.label;
@@ -17253,9 +17334,7 @@
       const summaryLines = [
         isConditionStep
           ? `步骤${stepCode} ${actionText} ${successText} ${failureText}`
-          : canRouteFailure
-            ? `步骤${stepCode} ${actionText} ${nextText} ${failureText}`
-            : `步骤${stepCode} ${actionText} ${nextText}`,
+          : `步骤${stepCode} ${actionText} ${nextText}`,
       ];
       const summaryText = summaryLines.filter(Boolean).join('\n');
       return createElement('div', {
@@ -17427,11 +17506,22 @@
   /**
    * refreshAffixTypeSelect 在前缀/后缀变化后刷新词缀类型选项。
    */
-  const refreshAffixTypeSelect = () => {
+  const refreshAffixTypeSelect = (preserveSelection = false) => {
     const equipmentType = state.ui.affixEquipmentSelect.value;
     const affixPosition = state.ui.affixPositionSelect.value;
+    const previousAffixType = preserveSelection ? state.ui.affixTypeSelect.value : '';
+    const previousTierValues = preserveSelection
+      ? Array.from(state.ui.affixTierSelect.selectedOptions).map((option) => option.value)
+      : [];
     setSelectOptions(state.ui.affixTypeSelect, getAffixTypeOptions(equipmentType, affixPosition), '选择词缀类型');
     setSelectOptions(state.ui.affixTierSelect, [], '选择词缀等级');
+    if (!previousAffixType || !Array.from(state.ui.affixTypeSelect.options).some((option) => option.value === previousAffixType)) return;
+    state.ui.affixTypeSelect.value = previousAffixType;
+    refreshAffixTierSelect();
+    const previousTierSet = new Set(previousTierValues);
+    Array.from(state.ui.affixTierSelect.options).forEach((option) => {
+      option.selected = previousTierSet.has(option.value);
+    });
   };
 
   /**
@@ -17441,7 +17531,12 @@
     const selectedOption = state.ui.affixTypeSelect.selectedOptions[0];
     const affixTypeName = state.ui.affixTypeSelect.value;
     const maxLevel = Number(selectedOption?.dataset?.maxLevel || 0);
-    setSelectOptions(state.ui.affixTierSelect, getAffixTierOptions(affixTypeName, maxLevel), '选择词缀等级');
+    setSelectOptions(state.ui.affixTierSelect, getAffixTierOptions(
+      affixTypeName,
+      maxLevel,
+      state.ui.affixEquipmentSelect.value,
+      state.ui.affixPositionSelect.value,
+    ), '选择词缀等级');
   };
 
   const getSpecialConditionMetricOptions = () => Object.entries(SPECIAL_CONDITION_METRICS)
@@ -17567,7 +17662,7 @@
     renderAffixConditionBuilder();
 
     state.ui.affixEquipmentSelect.addEventListener('change', refreshAffixPositionSelect);
-    state.ui.affixPositionSelect.addEventListener('change', refreshAffixTypeSelect);
+    state.ui.affixPositionSelect.addEventListener('change', () => refreshAffixTypeSelect(false));
     state.ui.affixTypeSelect.addEventListener('change', refreshAffixTierSelect);
     state.ui.conditionTypeSelect.addEventListener('change', updateAffixConditionTypePanels);
     state.ui.specialConditionMetricSelect.addEventListener('change', refreshSpecialConditionControls);
@@ -17718,13 +17813,7 @@
       className: 'poe2-section',
       children: [
         createElement('div', { className: 'poe2-section-title', textContent: '技能石' }),
-        createElement('div', {
-          className: 'poe2-field',
-          children: [
-            createElement('span', { textContent: '选择技能石（点击勾选多选）' }),
-            skillStoneSelectShell,
-          ],
-        }),
+        createLabeledControl('选择技能石', skillStoneSelectShell),
         state.ui.skillStoneSummary,
         createElement('div', {
           className: 'poe2-actions poe2-affix-actions',
@@ -18318,8 +18407,8 @@
           createElement('div', { textContent: '每个条件组有自己的“本组命中数”。例如组里有 3 条条件，命中数填 2，就表示任意 2 条满足即可。' }),
           createElement('div', { textContent: '命中数为 1 时，只要组内任意一条满足；命中数等于条件数量时，组内所有条件都必须满足。' }),
           createElement('div', { className: 'poe2-help-title', textContent: '条件类型' }),
-          createElement('div', { textContent: '词缀条件用于判断装备当前是否拥有指定词缀。选择词缀时会同时保存词缀名和所属词缀类型，避免同名词缀混淆。' }),
-          createElement('div', { textContent: '特殊条件用于判断装备状态，例如稀有度、前后缀数量、是否有空词缀、是否腐化、是否已有工艺词缀或后缀大师之。' }),
+          createElement('div', { textContent: '词缀条件用于判断装备当前是否拥有指定词缀。脚本初始化时会一次性读取工艺数据，按装备类型和前后缀追加“工艺词缀”类型；普通词缀表保持不变。' }),
+          createElement('div', { textContent: '特殊条件用于判断装备状态，例如稀有度、前后缀数量、是否有空词缀、是否腐化、是否已有工艺词缀。' }),
           createElement('div', { textContent: '词缀Roll值判断用于看装备数值是不是够高。可以判断武器伤害，也可以判断前缀、后缀、全部词缀或工艺词缀的平均/最低 Roll 百分比。' }),
           createElement('div', { textContent: '自定义打造里只有“判断条件”步骤会读取这些条件；普通通货、工艺和智能操作不会读取本步骤条件组。' }),
           createElement('div', { className: 'poe2-help-title', textContent: '例子' }),
@@ -18758,7 +18847,7 @@
    * buildUserInterface 创建主按钮、主面板和所有控件。
    */
   const buildUserInterface = () => {
-    const toggleButton = createButton('助手 2.17', () => {
+    const toggleButton = createButton('助手 2.18', () => {
       state.isPanelVisible = !state.isPanelVisible;
       syncPanelVisibility();
     });
@@ -18782,7 +18871,7 @@
     const headerElement = createElement('div', {
       className: 'poe2-header',
       children: [
-        createElement('div', { className: 'poe2-title', textContent: '助手测试服版 2.17' }),
+        createElement('div', { className: 'poe2-title', textContent: '助手测试服版 2.18' }),
         collapseButton,
       ],
     });
@@ -18992,7 +19081,7 @@
     }));
     const startChaosButton = createButton('混沌筛选', () => runTask('混沌筛选', async () => {
       const options = createClassicCraftSnapshot('混沌筛选', { prefix: 3, suffix: 3, total: 6 });
-      await ensureCraftBenchListForRollConditions(options);
+      await ensureCraftBenchListForConditions(options);
       const conditionGroups = options.affixConditionGroups;
       await eachTargetEquipment({ ...options, excludeRarities: [RARITY_TYPES.unique] }, (equipment) => (
         processChaosWithRarityPreparation(equipment, conditionGroups, options.rarity)
@@ -19000,7 +19089,7 @@
     }));
     const startAltAugButton = createButton('改造增幅', () => runTask('改造增幅', async () => {
       const options = createClassicCraftSnapshot('改造增幅', { prefix: 1, suffix: 1, total: 2 });
-      await ensureCraftBenchListForRollConditions(options);
+      await ensureCraftBenchListForConditions(options);
       const conditionGroups = options.affixConditionGroups;
       await eachTargetEquipment({ ...options, excludeRarities: [RARITY_TYPES.unique] }, (equipment) => (
         processAltAugWithRarityPreparation(equipment, conditionGroups, options.rarity)
@@ -19114,7 +19203,7 @@
     });
     const startContinuousCraftButton = createButton('开始自定义打造', () => runTask('自定义打造', async () => {
       const options = createCustomCraftSnapshot();
-      await ensureCraftBenchListForRollConditions(options);
+      await ensureCraftBenchListForConditions(options);
       const steps = options.continuousCraftSteps;
       const excludeRarities = options.rarity === RARITY_TYPES.unique ? [] : [RARITY_TYPES.unique];
       await eachTargetEquipment({ ...options, excludeRarities }, (equipment) => (
@@ -19237,15 +19326,14 @@
               className: 'poe2-continuous-column',
               children: [
                 createElement('div', { className: 'poe2-section-title', textContent: '失败' }),
-                state.ui.continuousFailureHandlingField = createLabeledControl(createHelpedLabel('条件不成立', '失败处理说明', [
-                  '这个设置对“条件判断”“工艺”“智能工艺”步骤生效。',
-                  '条件判断失败表示条件不成立；工艺失败表示工艺请求被后端拒绝。',
-                  '跳转到步骤：失败后跳到你选择的步骤。',
-                  '重铸后从步骤 A 开始：失败后只使用一次重铸石，再从第一个步骤重新开始。破裂装备重铸后如果停在魔法，也会继续流程。',
+                state.ui.continuousFailureHandlingField = createLabeledControl(createHelpedLabel('条件不成立', '条件不成立处理说明', [
+                  '这个设置只对“条件判断”步骤生效。',
+                  '跳转到步骤：条件不成立后跳到你选择的步骤。',
+                  '重铸后从步骤 A 开始：条件不成立后只使用一次重铸石，再从第一个步骤重新开始。破裂装备重铸后如果停在魔法，也会继续流程。',
                   '终止(异常错误)：停止任务并显示错误。',
                   '终止(打造成功)：结束当前装备，并计为一次命中。',
                   '终止(手动操作)：结束当前装备，不计为命中。',
-                  '失败分支不允许继续当前步骤；需要循环时请明确选择要跳回的步骤。',
+                  '条件步骤不允许继续当前步骤；需要循环时请明确选择要跳回的步骤。',
                 ]), state.ui.continuousFailureSelect),
                 state.ui.continuousFailureTargetField = createLabeledControl('不成立跳转步骤', state.ui.continuousFailureTargetInput),
               ],
@@ -19471,10 +19559,36 @@
   /**
    * initialize 启动脚本：注入样式、创建 UI、写入初始日志。
    */
-  const initialize = () => {
+  const initializeCraftAffixPickerData = async () => {
+    const pickerControls = [
+      state.ui.affixEquipmentSelect,
+      state.ui.affixPositionSelect,
+      state.ui.affixTypeSelect,
+      state.ui.affixTierSelect,
+    ].filter(Boolean);
+    pickerControls.forEach((control) => { control.disabled = true; });
+    try {
+      await ensureCraftBenchList();
+      if (state.ui.affixEquipmentSelect?.value && state.ui.affixPositionSelect?.value) {
+        refreshAffixTypeSelect(true);
+      }
+      const appendedCount = Object.values(state.craftBench.affixPickerByEquipment || {})
+        .flatMap((positionData) => Object.values(positionData || {}))
+        .reduce((total, crafts) => total + (Array.isArray(crafts) ? crafts.length : 0), 0);
+      addTraceLog(`初始化工艺词缀判断数据完成：按装备类型和前后缀缓存 ${appendedCount} 个可选项。`);
+    } catch (error) {
+      addLog(`初始化工艺词缀判断数据失败，本次只提供普通词缀：${error.message}`, 'warn');
+    } finally {
+      pickerControls.forEach((control) => { control.disabled = false; });
+    }
+  };
+
+  const initialize = async () => {
     installStyles();
     buildUserInterface();
-    addLog('助手 2.17 已加载。', 'compact');
+    addLog('正在加载工艺词缀数据…', 'compact');
+    await initializeCraftAffixPickerData();
+    addLog('助手 2.18 已加载。', 'compact');
     try {
       const importStatusText = sessionStorage.getItem(SKILL_TREE_IMPORT_STATUS_SESSION_KEY);
       if (importStatusText) {
