@@ -21485,7 +21485,7 @@
       .poe2-fractured-affix{padding:5px 7px;border-left:3px solid #d97706;background:#fff7ed;border-radius:4px;line-height:1.45;word-break:break-word}
       .poe2-fractured-actions{margin-top:8px}
       @media (max-width: 640px){
-        .poe2-toggle{left:auto;top:auto;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));width:auto!important;min-width:82px!important;max-width:112px!important;min-height:40px!important;max-height:44px!important;padding:9px 12px!important;font-size:13px;touch-action:none}
+        .poe2-toggle{top:auto!important;left:auto!important;right:12px!important;bottom:calc(12px + env(safe-area-inset-bottom))!important;width:auto!important;min-width:82px!important;max-width:112px!important;min-height:40px!important;max-height:44px!important;padding:9px 12px!important;font-size:13px;touch-action:none}
         .poe2-panel{left:8px!important;right:auto;top:8px!important;width:calc(100vw - 16px);max-height:calc(100dvh - 16px);border-radius:7px;font-size:13px}
         .poe2-header{padding:9px 10px;gap:8px;touch-action:none}
         .poe2-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -21548,7 +21548,7 @@
       }
       .poe2-theme-light{--poe2-bg:rgba(250,250,250,.98);--poe2-surface:#fff;--poe2-surface-soft:#f9fafb;--poe2-surface-muted:#eef2f7;--poe2-text:#111827;--poe2-text-soft:#374151;--poe2-muted:#6b7280;--poe2-border:#d6dbe3;--poe2-border-strong:#b8c0cc;--poe2-header:#f8fafc;--poe2-header-text:#111827;--poe2-primary:#4b5563;--poe2-primary-soft:#e5e7eb;--poe2-help-bg:#fff;--poe2-shadow:0 10px 30px rgba(0,0,0,.18);--poe2-chip-hover:#fff5f5;--poe2-warning-bg:#fff7ed;--poe2-log-bg:#111827;--poe2-log-text:#d1d5db}
       .poe2-theme-dark{--poe2-bg:rgba(24,28,36,.98);--poe2-surface:#1f2430;--poe2-surface-soft:#252b38;--poe2-surface-muted:#151a23;--poe2-text:#e5e7eb;--poe2-text-soft:#cbd5e1;--poe2-muted:#9ca3af;--poe2-border:#374151;--poe2-border-strong:#4b5563;--poe2-header:#111827;--poe2-header-text:#f8fafc;--poe2-primary:#cbd5e1;--poe2-primary-soft:#374151;--poe2-help-bg:#111827;--poe2-shadow:0 10px 34px rgba(0,0,0,.48);--poe2-chip-hover:#3b1d23;--poe2-warning-bg:#3a2815;--poe2-log-bg:#050816;--poe2-log-text:#d1d5db}
-      .poe2-toggle.poe2-theme-light,.poe2-toggle.poe2-theme-dark{background:var(--poe2-header);color:var(--poe2-header-text);border:1px solid var(--poe2-border);box-shadow:var(--poe2-shadow)}
+      .poe2-toggle.poe2-theme-light,.poe2-toggle.poe2-theme-dark{background:var(--poe2-header);color:var(--poe2-header-text);border:1px solid var(--poe2-border);box-shadow:var(--poe2-shadow);display:inline-flex!important;width:auto!important;height:auto!important;max-width:112px!important;max-height:44px!important}
       .poe2-panel.poe2-theme-light,.poe2-panel.poe2-theme-dark{background:var(--poe2-bg);color:var(--poe2-text);border-color:var(--poe2-border);box-shadow:var(--poe2-shadow)}
       .poe2-theme-light .poe2-header,.poe2-theme-dark .poe2-header,.poe2-theme-light .poe2-modal-header,.poe2-theme-dark .poe2-modal-header{background:var(--poe2-header);color:var(--poe2-header-text)}
       .poe2-theme-light .poe2-tab-list,.poe2-theme-dark .poe2-tab-list{background:var(--poe2-surface-muted);border-bottom-color:var(--poe2-border)}
