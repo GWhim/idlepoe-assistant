@@ -12850,8 +12850,8 @@
     slotLabel: stone.slotLabel || '',
     equipmentId: stone.equipmentId || '',
     equipmentName: stone.equipmentName || '',
-    socketId: stone.socketId || '',
-    socketType: stone.socketType || '',
+    socketId: stone.socketId ?? '',
+    socketType: stone.socketType ?? '',
     hasPracticeProgressData: typeof stone.hasPracticeProgressData === 'boolean'
       ? stone.hasPracticeProgressData
       : stone.level !== undefined && stone.levelUpExp !== undefined,
@@ -18742,8 +18742,10 @@
     if (!selectedIds.length) {
       throw new Error('请先在技能石列表中选择至少一颗技能石。');
     }
-    // 不区分背包/装备来源，[主手]、[副手] 等装备中的技能石也允许丢弃。
     const stoneById = new Map(state.skillStones.map((stone) => [stone.id, stone]));
+    const selectedStones = selectedIds
+      .map((stoneId) => stoneById.get(stoneId))
+      .filter((stone) => stone?.id);
     const selectedLabels = selectedIds
       .map((stoneId) => stoneById.get(stoneId))
       .filter(Boolean)
@@ -18756,12 +18758,49 @@
       addLog('已取消丢弃技能石。', 'compact');
       return;
     }
-    const payload = await destroySkillStones(selectedIds);
+    const equippedStones = selectedStones.filter((stone) => stone.source === 'equipment');
+    let destroyableIds = [...selectedIds];
+    if (equippedStones.length) {
+      addLog(`准备先取下装备中的技能石：${equippedStones.length} 颗。`, 'info');
+      const removeResults = await runConcurrentTasks(equippedStones, SKILL_STONE_PRACTICE_CONCURRENCY, async (stone) => {
+        if (!stone.equipmentId || stone.socketId === '') throw new Error(`${formatSkillStoneLabel(stone)} 缺少装备或孔位信息`);
+        const payload = await removeSkillStoneFromEquipment(stone.equipmentId, stone.socketId);
+        if (payload.success === false) throw new Error(payload.message || '取下技能石失败');
+        Object.assign(stone, {
+          source: 'backpack',
+          sourceLabel: '背包',
+          slotLabel: '',
+          equipmentId: '',
+          equipmentName: '',
+          socketId: '',
+          socketType: stone.category,
+        });
+        addLog(`已取下待丢弃技能石：${formatSkillStoneLabel(stone)}。`, 'detail');
+        return { stoneId: stone.id };
+      });
+      const removedIds = new Set(removeResults
+        .filter((result) => result?.stoneId)
+        .map((result) => result.stoneId));
+      const failedCount = removeResults.filter((result) => result?.error && !isRequestAbortError(result.error)).length;
+      if (failedCount) addLog(`装备技能石取下失败 ${failedCount}/${equippedStones.length} 颗，失败项不会继续提交丢弃。`, 'warn');
+      destroyableIds = selectedIds.filter((stoneId) => {
+        const stone = stoneById.get(stoneId);
+        return stone?.source !== 'equipment' || removedIds.has(stoneId);
+      });
+      if (!destroyableIds.length) throw new Error('装备技能石取下失败，未执行丢弃。');
+    }
+    const payload = await destroySkillStones(destroyableIds);
     if (payload.success === false) {
       throw new Error(payload.message || '丢弃技能石失败');
     }
-    addLog(`已丢弃 ${selectedIds.length} 颗技能石。`, 'compact');
     await refreshSkillStoneList();
+    const remainingIds = new Set(state.skillStones.map((stone) => stone.id));
+    const remainingCount = destroyableIds.filter((stoneId) => remainingIds.has(stoneId)).length;
+    if (remainingCount) {
+      addLog(`丢弃接口返回成功，但刷新后仍有 ${remainingCount}/${destroyableIds.length} 颗技能石存在，可能后端未实际删除。`, 'warn');
+    } else {
+      addLog(`已丢弃 ${destroyableIds.length} 颗技能石。`, 'compact');
+    }
   };
 
   /**
