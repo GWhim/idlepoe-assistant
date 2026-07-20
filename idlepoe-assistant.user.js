@@ -19022,13 +19022,13 @@
 
   /**
    * togglePositionAdjustMode 切换外部悬浮入口按钮的调位模式。
-   * 调位模式开启后可拖动“助手 2.20”按钮；再次点击关闭并保留当前位置。
+   * 调位模式开启后可拖动“助手 2.205”按钮；再次点击关闭并保留当前位置。
    */
   const togglePositionAdjustMode = () => {
     state.isTogglePositionMode = !state.isTogglePositionMode;
     state.ui.toggleButton?.classList.toggle('poe2-toggle-positioning', state.isTogglePositionMode);
     if (state.isTogglePositionMode) {
-      addLog('已开启调整位置模式：拖动外部“助手 2.20”按钮即可改变入口位置，再次点击“调整位置”关闭。', 'compact');
+      addLog('已开启调整位置模式：拖动外部“助手 2.205”按钮即可改变入口位置，再次点击“调整位置”关闭。', 'compact');
     } else {
       addLog('已关闭调整位置模式，外部入口按钮位置已保存。', 'compact');
     }
@@ -21333,7 +21333,7 @@
    */
   const installStyles = () => {
     GM_addStyle(`
-      .poe2-toggle{position:fixed;left:18px;top:22px;z-index:99999;padding:8px 12px;border:0;border-radius:6px;background:#2f6fed;color:#fff;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,.25);cursor:pointer}
+      .poe2-toggle{position:fixed!important;left:18px;top:22px;z-index:99999;display:inline-flex!important;align-items:center;justify-content:center;box-sizing:border-box;width:auto!important;min-width:64px!important;max-width:112px!important;height:auto!important;min-height:36px!important;max-height:44px!important;margin:0!important;padding:8px 12px!important;border:0;border-radius:6px;background:#2f6fed;color:#fff;font-size:13px;line-height:1!important;white-space:nowrap!important;box-shadow:0 4px 16px rgba(0,0,0,.25);cursor:pointer;appearance:none}
       .poe2-toggle-positioning{cursor:move;outline:2px solid #f59e0b;outline-offset:2px}
       .poe2-panel{position:fixed;left:20px;top:80px;z-index:99998;width:min(560px,calc(100vw - 24px));max-height:calc(100vh - 40px);overflow:auto;background:rgba(250,250,250,.98);color:#1b1f29;border:1px solid rgba(0,0,0,.25);border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,.28);font-size:13px}
       .poe2-panel[hidden]{display:none}
@@ -21485,7 +21485,7 @@
       .poe2-fractured-affix{padding:5px 7px;border-left:3px solid #d97706;background:#fff7ed;border-radius:4px;line-height:1.45;word-break:break-word}
       .poe2-fractured-actions{margin-top:8px}
       @media (max-width: 640px){
-        .poe2-toggle{right:12px;bottom:calc(12px + env(safe-area-inset-bottom));min-width:76px;min-height:40px;padding:9px 12px;font-size:13px;touch-action:none}
+        .poe2-toggle{left:auto;top:auto;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));width:auto!important;min-width:82px!important;max-width:112px!important;min-height:40px!important;max-height:44px!important;padding:9px 12px!important;font-size:13px;touch-action:none}
         .poe2-panel{left:8px!important;right:auto;top:8px!important;width:calc(100vw - 16px);max-height:calc(100dvh - 16px);border-radius:7px;font-size:13px}
         .poe2-header{padding:9px 10px;gap:8px;touch-action:none}
         .poe2-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -21707,7 +21707,7 @@
    * buildUserInterface 创建主按钮、主面板和所有控件。
    */
   const buildUserInterface = () => {
-    const toggleButton = createButton('助手 2.20', () => {
+    const toggleButton = createButton('助手 2.205', () => {
       state.isPanelVisible = !state.isPanelVisible;
       syncPanelVisibility();
     });
@@ -21731,7 +21731,7 @@
     const headerElement = createElement('div', {
       className: 'poe2-header',
       children: [
-        createElement('div', { className: 'poe2-title', textContent: '助手测试服版 2.20' }),
+        createElement('div', { className: 'poe2-title', textContent: '助手测试服版 2.205' }),
         collapseButton,
       ],
     });
@@ -22467,7 +22467,7 @@
     buildUserInterface();
     addLog('正在加载工艺词缀数据…', 'compact');
     await initializeCraftAffixPickerData();
-    addLog('助手 2.20 已加载。', 'compact');
+    addLog('助手 2.205 已加载。', 'compact');
     void initializeGardenCraftData();
     try {
       const importStatusText = sessionStorage.getItem(SKILL_TREE_IMPORT_STATUS_SESSION_KEY);
