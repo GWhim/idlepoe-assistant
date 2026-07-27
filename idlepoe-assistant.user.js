@@ -22556,7 +22556,8 @@
       .poe2-unique-craft-step-summary{font-size:12px;color:#6b7280;line-height:1.45;margin-top:-4px;word-break:break-word}
       .poe2-plan-toggle-field .poe2-button{width:100%}
       .poe2-input{box-sizing:border-box;width:100%;height:30px;border:1px solid #b8c0cc;border-radius:5px;padding:4px 7px;background:#fff;color:#111827}
-      select.poe2-input[multiple]{height:96px}
+      select.poe2-input[multiple]{height:96px;overflow:auto;white-space:nowrap;-webkit-overflow-scrolling:touch}
+      select.poe2-input[multiple] option{white-space:nowrap}
       .poe2-stone-select{height:240px!important}
       .poe2-summary{font-size:12px;color:#4b5563;margin:8px 0 0}
       .poe2-battle-summary{padding:8px;border:1px solid #d6dbe3;border-radius:6px;background:#f9fafb;line-height:1.5;word-break:break-word}
@@ -22608,21 +22609,22 @@
       .poe2-combobox-option:hover,.poe2-combobox-option:focus{background:rgba(49,95,186,.22);color:var(--poe2-text)}
       .poe2-combobox-empty{padding:7px 9px;color:var(--poe2-text-muted);font-size:12px}
       .poe2-multiselect{position:relative;width:100%;min-width:0}
-      .poe2-multiselect-trigger{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:36px;box-sizing:border-box;padding:7px 10px;border:1px solid var(--poe2-border-strong);border-radius:6px;background:var(--poe2-surface);color:var(--poe2-text);cursor:pointer;font:inherit;text-align:left}
-      .poe2-multiselect-summary-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .poe2-multiselect-trigger{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:36px;box-sizing:border-box;padding:7px 10px;border:1px solid var(--poe2-border-strong);border-radius:6px;background:var(--poe2-surface);color:var(--poe2-text);cursor:pointer;font:inherit;text-align:left;overflow:hidden}
+      .poe2-multiselect-summary-text{display:block;flex:1 1 auto;min-width:0;overflow-x:auto;overflow-y:hidden;text-overflow:clip;white-space:nowrap;-webkit-overflow-scrolling:touch;scrollbar-width:thin}
       .poe2-multiselect-arrow{color:var(--poe2-muted);font-size:12px;line-height:1}
       .poe2-multiselect-trigger:focus{outline:none;border-color:#2f6fe4;box-shadow:0 0 0 1px rgba(47,111,228,.35)}
       .poe2-multiselect-menu{display:grid;grid-template-rows:auto auto minmax(0,1fr);gap:6px;height:260px;overflow:hidden;margin-top:4px;padding:7px;border:1px solid var(--poe2-border);border-radius:6px;background:var(--poe2-surface);box-shadow:0 10px 24px rgba(0,0,0,.24)}
       .poe2-multiselect-menu[hidden]{display:none}
       .poe2-multiselect-filter{height:28px;font-size:12px}
-      .poe2-multiselect-selected{min-width:0;padding-bottom:6px;border-bottom:1px solid var(--poe2-border)}
-      .poe2-multiselect-summary-line{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--poe2-text-soft);font-size:12px;line-height:18px}
+      .poe2-multiselect-selected{min-width:0;overflow-x:auto;overflow-y:hidden;padding-bottom:6px;border-bottom:1px solid var(--poe2-border);white-space:nowrap;-webkit-overflow-scrolling:touch;scrollbar-width:thin}
+      .poe2-multiselect-summary-line{display:block;width:max-content;min-width:100%;overflow:visible;text-overflow:clip;white-space:nowrap;color:var(--poe2-text-soft);font-size:12px;line-height:18px}
       .poe2-multiselect-placeholder{color:var(--poe2-muted);font-size:12px}
-      .poe2-multiselect-options{display:grid;gap:2px;min-height:0;overflow:auto}
-      .poe2-multiselect-option{display:grid;grid-template-columns:18px minmax(0,1fr);gap:7px;align-items:start;padding:6px 7px;border-radius:4px;color:var(--poe2-text);font-size:12px;line-height:1.35;cursor:pointer}
+      .poe2-multiselect-options{display:grid;gap:2px;min-height:0;overflow:auto;-webkit-overflow-scrolling:touch}
+      .poe2-multiselect-option{display:grid;grid-template-columns:18px max-content;gap:7px;align-items:start;box-sizing:border-box;width:max-content;min-width:100%;padding:6px 7px;border-radius:4px;color:var(--poe2-text);font-size:12px;line-height:1.35;white-space:nowrap;cursor:pointer}
       .poe2-multiselect-option[hidden]{display:none}
       .poe2-multiselect-option:hover{background:rgba(49,95,186,.22)}
       .poe2-multiselect-option input{margin:1px 0 0}
+      .poe2-multiselect-option span{white-space:nowrap}
       .poe2-affix-group-list{display:grid;gap:8px;margin-top:8px}
       .poe2-affix-group-card{box-sizing:border-box;border:1px solid #d6dbe3;border-radius:6px;padding:8px;background:#f9fafb;cursor:pointer}
       .poe2-affix-group-card.active{border:2px solid #16a34a;font-weight:700}
