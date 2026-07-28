@@ -14805,6 +14805,7 @@
       equipmentTypeMask: getAffixPickerEquipmentMask(equipmentType),
       corrupted: state.ui.equipmentFilterCorruptedSelect?.value || 'any',
       corruptedBase: state.ui.equipmentFilterCorruptedBaseSelect?.value || 'any',
+      affixMatchMode: state.ui.equipmentFilterAffixMatchSelect?.value || 'include',
       affixConditionGroups: buildEquipmentFilterAffixConditions(),
     };
   };
@@ -14819,7 +14820,11 @@
   const isEquipmentFilterDetailMatched = (equipment, options) => {
     if (options.corruptedBase === 'yes' && !getCorruptedBaseSignature(equipment)) return false;
     if (options.corruptedBase === 'no' && getCorruptedBaseSignature(equipment)) return false;
-    if (options.affixConditionGroups.length && !isAffixMatched(equipment, options.affixConditionGroups)) return false;
+    if (options.affixConditionGroups.length && options.affixMatchMode !== 'any') {
+      const matched = isAffixMatched(equipment, options.affixConditionGroups);
+      if (options.affixMatchMode === 'include' && !matched) return false;
+      if (options.affixMatchMode === 'exclude' && matched) return false;
+    }
     return true;
   };
 
@@ -18596,6 +18601,11 @@
       { value: 'yes', label: '有腐化基底' },
       { value: 'no', label: '无腐化基底' },
     ], 'any');
+    state.ui.equipmentFilterAffixMatchSelect = createSelect([
+      { value: 'include', label: '满足任意详细词缀' },
+      { value: 'exclude', label: '不满足任意详细词缀' },
+      { value: 'any', label: '不按词缀筛选' },
+    ], 'include');
     state.ui.equipmentFilterPositionSelect = createSelect([], '');
     state.ui.equipmentFilterAffixTypeSelect = createSelect([], '');
     state.ui.equipmentFilterAffixTierSelect = createSelect([], '');
@@ -18630,7 +18640,7 @@
         createElement('div', { className: 'poe2-section-title', textContent: '筛选装备' }),
         createElement('div', {
           className: 'poe2-summary',
-          textContent: '只读扫描背包或储藏装备，支持装备类型、腐化状态、详细词缀和腐化基底筛选。',
+          textContent: '只读扫描背包或储藏装备，支持装备类型、腐化状态、满足/不满足详细词缀和腐化基底筛选。',
         }),
         createElement('div', {
           className: 'poe2-grid poe2-affix-picker-grid',
@@ -18640,6 +18650,7 @@
             createLabeledControl('装备类型', state.ui.equipmentFilterEquipmentSelect),
             createLabeledControl('是否腐化', state.ui.equipmentFilterCorruptedSelect),
             createLabeledControl('腐化基底', state.ui.equipmentFilterCorruptedBaseSelect),
+            createLabeledControl('词缀条件', state.ui.equipmentFilterAffixMatchSelect),
             createLabeledControl('词缀位置', state.ui.equipmentFilterPositionSelect),
             createLabeledControl('词缀类型', state.ui.equipmentFilterAffixTypeSelect),
             createLabeledControl('详细词缀', state.ui.equipmentFilterAffixTierSelect, 'poe2-affix-tier-field'),
