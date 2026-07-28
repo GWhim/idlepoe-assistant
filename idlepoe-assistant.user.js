@@ -14680,6 +14680,120 @@
     return match ? new URL(match[1], ownerUrl).href : findPageAssetUrl(new RegExp(filePattern), fallbackPath);
   };
 
+  const resolveVueCreateVNode = (vueCoreModule) => (
+    vueCoreModule?.createVNode
+    || vueCoreModule?.h
+    || vueCoreModule?.l
+    || Object.values(vueCoreModule || {}).find((candidate) => (
+      typeof candidate === 'function' && /createVNode|^h$/.test(String(candidate.name || ''))
+    ))
+    || null
+  );
+
+  const resolveAntdModal = (antdModule) => (
+    antdModule?.Modal
+    || antdModule?.M
+    || antdModule?.default?.Modal
+    || Object.values(antdModule || {}).find((candidate) => (
+      candidate
+      && typeof candidate === 'object'
+      && typeof candidate.info === 'function'
+      && typeof candidate.confirm === 'function'
+    ))
+    || null
+  );
+
+  const getEquipmentDetailThemeClass = () => (
+    state.ui.root?.classList.contains('poe2-theme-dark') ? 'poe2-theme-dark' : 'poe2-theme-light'
+  );
+
+  const closeAssistantEquipmentDetailModal = () => {
+    state.ui.equipmentDetailModal?.remove();
+    state.ui.equipmentDetailModal = null;
+  };
+
+  const getEquipmentDetailSummaryLines = (equipment) => {
+    const lines = [
+      `名称：${getEquipmentDisplayName(equipment)}${equipment?.baseName ? ` / ${equipment.baseName}` : ''}`,
+      `ID：${equipment?.id || '未知'}`,
+      `稀有度：${SPECIAL_CONDITION_RARITY_LABELS[equipment?.rarity] || equipment?.rarity || '未知'}`,
+      `物等：${equipment?.itemLevel || '?'}`,
+      `腐化：${getEquipmentFilterCorruptedLabel(equipment)}`,
+      `腐化基底：${getEquipmentFilterCorruptedBaseLabel(equipment)}`,
+    ];
+    if (equipment?.equipmentType) lines.push(`装备类型：${equipment.equipmentType}`);
+    if (equipment?.requirements) {
+      const requirementText = Object.entries(equipment.requirements)
+        .filter(([, value]) => Number(value) > 0)
+        .map(([key, value]) => `${key}:${value}`)
+        .join(' / ');
+      if (requirementText) lines.push(`需求：${requirementText}`);
+    }
+    const corruptedMagicText = formatEquipmentCorruptedMagicEntries(equipment);
+    if (corruptedMagicText && corruptedMagicText !== '无') lines.push(`腐化词缀：${corruptedMagicText}`);
+    return lines;
+  };
+
+  const openAssistantEquipmentDetailModal = (equipment, options = {}) => {
+    closeAssistantEquipmentDetailModal();
+    const fallbackReason = String(options.reason || '').trim();
+    const affixElements = Array.isArray(equipment?.affixes) && equipment.affixes.length
+      ? equipment.affixes.map((affix) => createElement('div', {
+        className: 'poe2-fractured-affix',
+        textContent: `${formatAffixPositionName(affix?.type)} ${affix?.name || affix?.affixName || '未知词缀'}`,
+      }))
+      : [createElement('div', { className: 'poe2-empty', textContent: '暂无词缀明细。' })];
+    const rawDetailText = JSON.stringify(equipment, null, 2);
+    const modalElement = createElement('div', {
+      className: `poe2-modal ${getEquipmentDetailThemeClass()}`,
+      children: [
+        createElement('div', {
+          className: 'poe2-modal-dialog',
+          children: [
+            createElement('div', {
+              className: 'poe2-modal-header',
+              children: [
+                createElement('div', {
+                  children: [
+                    createElement('div', { className: 'poe2-modal-title', textContent: '装备详情' }),
+                    fallbackReason
+                      ? createElement('div', { className: 'poe2-muted', textContent: `已切换到助手详情视图：${fallbackReason}` })
+                      : createElement('div', { className: 'poe2-muted', textContent: '助手详情视图' }),
+                  ],
+                }),
+                createElement('div', {
+                  className: 'poe2-actions',
+                  children: [createButton('关闭', closeAssistantEquipmentDetailModal)],
+                }),
+              ],
+            }),
+            createElement('div', {
+              className: 'poe2-modal-body',
+              children: [
+                createElement('div', {
+                  className: 'poe2-summary',
+                  textContent: getEquipmentDetailSummaryLines(equipment).join('\n'),
+                }),
+                createElement('div', { className: 'poe2-section-title', textContent: '词缀' }),
+                createElement('div', { className: 'poe2-fractured-affixes', children: affixElements }),
+                createElement('div', { className: 'poe2-section-title', textContent: '原始数据' }),
+                createElement('pre', {
+                  className: 'poe2-summary',
+                  textContent: rawDetailText,
+                }),
+              ],
+            }),
+          ],
+        }),
+      ],
+    });
+    modalElement.addEventListener('click', (event) => {
+      if (event.target === modalElement) closeAssistantEquipmentDetailModal();
+    });
+    document.body.append(modalElement);
+    state.ui.equipmentDetailModal = modalElement;
+  };
+
   const loadPageEquipmentModalModules = async () => {
     if (PAGE_MODULE_CACHE.equipment) return PAGE_MODULE_CACHE.equipment;
     PAGE_MODULE_CACHE.equipment = (async () => {
@@ -14700,8 +14814,8 @@
       const EquipmentComponent = Object.values(gameCoreModule).find((candidate) => (
         candidate?.__name === 'Equipment' || candidate?.name === 'Equipment'
       ));
-      const createVNode = vueCoreModule.l;
-      const Modal = antdModule.M;
+      const createVNode = resolveVueCreateVNode(vueCoreModule);
+      const Modal = resolveAntdModal(antdModule);
       if (!EquipmentComponent || !createVNode || !Modal?.info) {
         throw new Error('网页端装备详情模块不可用');
       }
@@ -14731,13 +14845,21 @@
     });
   };
 
+  const openEquipmentDetailModal = async (equipment) => {
+    try {
+      await openPageEquipmentDetailModal(equipment);
+    } catch (error) {
+      openAssistantEquipmentDetailModal(equipment, { reason: error.message || error });
+    }
+  };
+
   const openFracturedEquipmentDetail = async (equipmentId) => {
     const equipment = state.fracturedEquipments.find((item) => item.id === equipmentId);
     if (!equipment) return;
     try {
       const freshEquipment = await fetchEquipmentDetail(equipmentId);
       const detailEquipment = freshEquipment ? { ...equipment, ...freshEquipment, id: freshEquipment.id || equipment.id } : equipment;
-      await openPageEquipmentDetailModal(detailEquipment);
+      await openEquipmentDetailModal(detailEquipment);
     } catch (error) {
       addLog(`${equipment.name} 查看详情失败：${error.message || error}`, 'error');
     }
@@ -14984,7 +15106,7 @@
             id: freshEquipment.id || equipment.id,
             assistantSourceLocation: equipment.assistantSourceLocation,
           }) : equipment;
-          await openPageEquipmentDetailModal(detailEquipment);
+          await openEquipmentDetailModal(detailEquipment);
         } catch (error) {
           addLog(`${getEquipmentDisplayName(equipment)} 查看详情失败：${error.message || error}`, 'error');
         }
