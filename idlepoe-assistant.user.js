@@ -14783,17 +14783,150 @@
   };
 
   const buildEquipmentFilterAffixConditions = () => {
-    const selectedOptions = Array.from(state.ui.equipmentFilterAffixTierSelect?.selectedOptions || []);
-    if (!selectedOptions.length) return [];
-    const conditions = selectedOptions
-      .map((option) => normalizeAffixCondition({
-        name: option.value,
-        affixType: option.dataset.affixType || state.ui.equipmentFilterAffixTypeSelect?.value || '',
-        affixId: option.dataset.affixId,
-        craftId: option.dataset.craftId,
-      }))
+    return snapshotAffixConditionGroups(state.equipmentFilterConditionGroups);
+  };
+
+  const getEquipmentFilterAffixConditionGroupLabel = (groupIndex) => `F-${groupIndex + 1}`;
+
+  const getActiveEquipmentFilterAffixGroupIndex = () => {
+    const rawIndex = Number.parseInt(state.ui.equipmentFilterAffixGroupSelect?.value || '0', 10);
+    if (Number.isNaN(rawIndex) || rawIndex < 0) return 0;
+    if (!state.equipmentFilterConditionGroups?.[rawIndex]) return 0;
+    return rawIndex;
+  };
+
+  const setEquipmentFilterAffixGroupMinRequired = (groupIndex, value) => {
+    const currentGroup = normalizeAffixConditionGroup(state.equipmentFilterConditionGroups[groupIndex]);
+    const parsedValue = Number.parseInt(value, 10);
+    const maxRequired = Math.max(1, currentGroup.conditions.length);
+    state.equipmentFilterConditionGroups[groupIndex] = {
+      ...currentGroup,
+      minRequired: Math.min(maxRequired, Math.max(1, Number.isFinite(parsedValue) ? parsedValue : 1)),
+    };
+    renderEquipmentFilterConditionBuilder();
+  };
+
+  const renderEquipmentFilterConditionBuilder = () => {
+    const groupSelect = state.ui.equipmentFilterAffixGroupSelect;
+    const groupList = state.ui.equipmentFilterAffixGroupList;
+    if (!groupSelect || !groupList) return;
+    if (!state.equipmentFilterConditionGroups?.length) {
+      state.equipmentFilterConditionGroups = [createEmptyAffixConditionGroup()];
+    }
+    state.equipmentFilterConditionGroups = state.equipmentFilterConditionGroups.map(normalizeAffixConditionGroup);
+    const selectedIndex = Math.min(getActiveEquipmentFilterAffixGroupIndex(), state.equipmentFilterConditionGroups.length - 1);
+    groupSelect.replaceChildren(...state.equipmentFilterConditionGroups.map((group, groupIndex) => {
+      const option = createElement('option', {
+        value: String(groupIndex),
+        textContent: `${getEquipmentFilterAffixConditionGroupLabel(groupIndex)}（${group.conditions.length} 条，命中 ${Math.min(group.minRequired, Math.max(group.conditions.length, 1))}）`,
+      });
+      option.selected = groupIndex === selectedIndex;
+      return option;
+    }));
+    groupList.replaceChildren(...state.equipmentFilterConditionGroups.map((group, groupIndex) => {
+      const minInput = createElement('input', {
+        className: 'poe2-input poe2-affix-min-input',
+        type: 'number',
+        value: String(group.minRequired),
+        onChange: (event) => setEquipmentFilterAffixGroupMinRequired(groupIndex, event.target.value),
+      });
+      minInput.min = '1';
+      minInput.max = String(Math.max(1, group.conditions.length));
+      minInput.title = '本组至少命中几个条件。命中数不能小于 1，也不能超过本组条件数量。';
+      const conditionElements = group.conditions.length
+        ? group.conditions.map((condition, affixIndex) => createElement('button', {
+          className: 'poe2-affix-chip',
+          textContent: formatAffixConditionLabel(condition),
+          onClick: () => removeEquipmentFilterAffixCondition(groupIndex, affixIndex),
+        }))
+        : [createElement('div', { className: 'poe2-affix-empty', textContent: '空条件组' })];
+      return createElement('div', {
+        className: `poe2-affix-group-card${groupIndex === selectedIndex ? ' active' : ''}`,
+        onClick: (event) => {
+          if (event.target.closest('button,input,label')) return;
+          state.ui.equipmentFilterAffixGroupSelect.value = String(groupIndex);
+          renderEquipmentFilterConditionBuilder();
+        },
+        children: [
+          createElement('div', {
+            className: 'poe2-affix-group-head',
+            children: [
+              createElement('strong', { textContent: getEquipmentFilterAffixConditionGroupLabel(groupIndex) }),
+              createElement('label', {
+                className: 'poe2-affix-min-field',
+                children: [
+                  createElement('span', { textContent: '本组命中数' }),
+                  minInput,
+                ],
+              }),
+              createButton('删除组', () => removeEquipmentFilterAffixGroup(groupIndex)),
+            ],
+          }),
+          createElement('div', { className: 'poe2-affix-chip-list', children: conditionElements }),
+        ],
+      });
+    }));
+  };
+
+  const addEquipmentFilterAffixConditions = (selectedAffixOptions) => {
+    const selectedAffixType = String(state.ui.equipmentFilterAffixTypeSelect?.value || '').trim();
+    const cleanConditions = selectedAffixOptions
+      .map((option) => {
+        if (option && typeof option === 'object' && 'value' in option) {
+          return normalizeAffixCondition({
+            name: option.value,
+            affixType: option.dataset?.affixType || selectedAffixType,
+            affixId: option.dataset?.affixId,
+            craftId: option.dataset?.craftId,
+          });
+        }
+        return normalizeAffixCondition({ name: option, affixType: selectedAffixType });
+      })
       .filter((condition) => condition.name || condition.craftId);
-    return conditions.length ? [{ minRequired: 1, conditions }] : [];
+    if (!cleanConditions.length) {
+      addLog('请先选择一个或多个详细词缀。', 'warn');
+      return;
+    }
+    const groupIndex = getActiveEquipmentFilterAffixGroupIndex();
+    const currentGroup = normalizeAffixConditionGroup(state.equipmentFilterConditionGroups[groupIndex]);
+    const mergedConditions = [...currentGroup.conditions, ...cleanConditions].map(normalizeAffixCondition);
+    const seenConditionKeys = new Set();
+    const conditions = mergedConditions.filter((condition) => {
+      const conditionKey = getAffixConditionKey(condition);
+      if (!condition.name || seenConditionKeys.has(conditionKey)) return false;
+      seenConditionKeys.add(conditionKey);
+      return true;
+    });
+    state.equipmentFilterConditionGroups[groupIndex] = { ...currentGroup, conditions };
+    renderEquipmentFilterConditionBuilder();
+  };
+
+  const addEquipmentFilterAffixGroup = () => {
+    state.equipmentFilterConditionGroups.push(createEmptyAffixConditionGroup());
+    state.ui.equipmentFilterAffixGroupSelect.value = String(state.equipmentFilterConditionGroups.length - 1);
+    renderEquipmentFilterConditionBuilder();
+  };
+
+  const removeEquipmentFilterAffixCondition = (groupIndex, affixIndex) => {
+    const group = normalizeAffixConditionGroup(state.equipmentFilterConditionGroups[groupIndex]);
+    if (!group.conditions.length) return;
+    group.conditions.splice(affixIndex, 1);
+    state.equipmentFilterConditionGroups[groupIndex] = group;
+    renderEquipmentFilterConditionBuilder();
+  };
+
+  const removeEquipmentFilterAffixGroup = (groupIndex) => {
+    if (state.equipmentFilterConditionGroups.length <= 1) {
+      state.equipmentFilterConditionGroups = [createEmptyAffixConditionGroup()];
+    } else {
+      state.equipmentFilterConditionGroups.splice(groupIndex, 1);
+    }
+    renderEquipmentFilterConditionBuilder();
+  };
+
+  const clearEquipmentFilterAffixConditions = () => {
+    state.equipmentFilterConditionGroups = [createEmptyAffixConditionGroup()];
+    renderEquipmentFilterConditionBuilder();
   };
 
   const readEquipmentFilterOptions = () => {
@@ -18667,15 +18800,17 @@
       { value: 'no', label: '无腐化基底' },
     ], 'any');
     state.ui.equipmentFilterAffixMatchSelect = createSelect([
-      { value: 'include', label: '满足任意详细词缀' },
-      { value: 'exclude', label: '不满足任意详细词缀' },
-      { value: 'any', label: '不按词缀筛选' },
+      { value: 'include', label: '满足任一条件组' },
+      { value: 'exclude', label: '不满足任一条件组' },
+      { value: 'any', label: '不按条件组筛选' },
     ], 'include');
     state.ui.equipmentFilterPositionSelect = createSelect([], '');
     state.ui.equipmentFilterAffixTypeSelect = createSelect([], '');
     state.ui.equipmentFilterAffixTierSelect = createSelect([], '');
     state.ui.equipmentFilterAffixTierSelect.multiple = true;
     state.ui.equipmentFilterAffixTierSelect.size = 5;
+    state.ui.equipmentFilterAffixGroupSelect = createSelect([], '');
+    state.ui.equipmentFilterAffixGroupList = createElement('div', { className: 'poe2-affix-group-list' });
     state.ui.equipmentFilterBatchStoneSelect = createSelect(BATCH_STONE_OPTIONS.map((option) => ({
       value: option.type,
       label: option.label,
@@ -18691,10 +18826,17 @@
     setSelectOptions(state.ui.equipmentFilterPositionSelect, [], '选择词缀位置');
     setSelectOptions(state.ui.equipmentFilterAffixTypeSelect, [], '选择词缀类型');
     setSelectOptions(state.ui.equipmentFilterAffixTierSelect, [], '选择详细词缀');
+    state.equipmentFilterConditionGroups = [createEmptyAffixConditionGroup()];
+    renderEquipmentFilterConditionBuilder();
     state.ui.equipmentFilterEquipmentSelect.addEventListener('change', refreshEquipmentFilterPositionSelect);
     state.ui.equipmentFilterPositionSelect.addEventListener('change', refreshEquipmentFilterAffixTypeSelect);
     state.ui.equipmentFilterAffixTypeSelect.addEventListener('change', refreshEquipmentFilterAffixTierSelect);
 
+    const addAffixButton = createButton('添加到当前组', () => {
+      addEquipmentFilterAffixConditions(Array.from(state.ui.equipmentFilterAffixTierSelect.selectedOptions || []));
+    });
+    const addGroupButton = createButton('添加条件组', addEquipmentFilterAffixGroup);
+    const clearAffixButton = createButton('清空条件', clearEquipmentFilterAffixConditions);
     const filterButton = createButton('开始筛选', () => runTask('筛选装备', runEquipmentFilter));
     filterButton.classList.add('poe2-success-button');
     const applyCurrencyButton = createButton('对结果使用通货', () => runTask('筛选结果批量通货', applyCurrencyToEquipmentFilterResults));
@@ -18713,7 +18855,7 @@
         createElement('div', { className: 'poe2-section-title', textContent: '筛选装备' }),
         createElement('div', {
           className: 'poe2-summary',
-          textContent: '只读扫描背包或储藏装备，支持装备类型、腐化状态、满足/不满足详细词缀和腐化基底筛选。',
+          textContent: '只读扫描背包或储藏装备，支持装备类型、腐化状态、腐化基底，以及多个词缀条件组筛选。',
         }),
         createElement('div', {
           className: 'poe2-grid poe2-affix-picker-grid',
@@ -18727,9 +18869,15 @@
             createLabeledControl('词缀位置', state.ui.equipmentFilterPositionSelect),
             createLabeledControl('词缀类型', state.ui.equipmentFilterAffixTypeSelect),
             createLabeledControl('详细词缀', state.ui.equipmentFilterAffixTierSelect, 'poe2-affix-tier-field'),
+            createLabeledControl('当前条件组', state.ui.equipmentFilterAffixGroupSelect),
+            createElement('div', {
+              className: 'poe2-actions poe2-affix-actions poe2-affix-picker-actions',
+              children: [addAffixButton, addGroupButton, clearAffixButton],
+            }),
             createLabeledControl('结果通货', state.ui.equipmentFilterBatchStoneSelect),
           ],
         }),
+        state.ui.equipmentFilterAffixGroupList,
         createElement('div', {
           className: 'poe2-actions poe2-affix-actions',
           children: [
