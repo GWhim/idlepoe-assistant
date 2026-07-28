@@ -14934,6 +14934,71 @@
     addLog(`装备筛选完成：${getEquipmentFilterLocationLabel(options.location)}匹配 ${state.equipmentFilterResults.length} 件。`, 'compact');
   };
 
+  const getCurrentEquipmentFilterResults = () => (state.equipmentFilterResults || [])
+    .filter((equipment) => equipment?.id);
+
+  const applyCurrencyToEquipmentFilterResults = async () => {
+    const equipments = getCurrentEquipmentFilterResults();
+    if (!equipments.length) throw new Error('当前没有筛选结果，请先筛选装备。');
+    const stoneType = Number.parseInt(state.ui.equipmentFilterBatchStoneSelect?.value, 10);
+    if (!Number.isFinite(stoneType)) throw new Error('请选择要使用的通货。');
+    const stoneName = getModifyTypeLabel(stoneType);
+    const confirmed = window.confirm(`确认对当前 ${equipments.length} 件筛选结果使用 ${stoneName} 吗？`);
+    if (!confirmed) {
+      addLog('已取消筛选结果批量通货。', 'compact');
+      return;
+    }
+    addLog(`筛选结果批量通货开始：${equipments.length} 件，通货 ${stoneName}，并发 ${BATCH_CURRENCY_CONCURRENCY}。`, 'compact');
+    const qualityStoneTypes = [MODIFY_TYPES.whetstone, MODIFY_TYPES.armourScrap, MODIFY_TYPES.glassblowerBauble];
+    const targetCount = equipments.length;
+    const results = await runConcurrentTasks(equipments, BATCH_CURRENCY_CONCURRENCY, async (equipment) => {
+      if (qualityStoneTypes.includes(stoneType)) {
+        await processQualityUntilMax(equipment, stoneType, targetCount);
+      } else {
+        await processSingleStone(equipment, stoneType, targetCount);
+      }
+      return { success: true };
+    });
+    const failedResults = results.filter((result) => result?.error);
+    logGroupedBatchCurrencyFailures(failedResults, equipments.length, '筛选结果批量通货');
+    renderEquipmentFilterResults();
+    addLog(`筛选结果批量通货完成：成功 ${equipments.length - failedResults.length}/${equipments.length} 件。`, failedResults.length ? 'warn' : 'success');
+  };
+
+  const destroyEquipmentFilterResults = async () => {
+    const equipments = getCurrentEquipmentFilterResults();
+    if (!equipments.length) throw new Error('当前没有筛选结果，请先筛选装备。');
+    const sampleNames = equipments
+      .slice(0, 5)
+      .map((equipment) => `- ${getEquipmentDisplayName(equipment)}${equipment.baseName ? ` / ${equipment.baseName}` : ''}`)
+      .join('\n');
+    const extraText = equipments.length > 5 ? `\n...以及另外 ${equipments.length - 5} 件` : '';
+    const confirmed = window.confirm(`确认丢弃当前 ${equipments.length} 件筛选结果吗？该操作不可撤销。\n${sampleNames}${extraText}`);
+    if (!confirmed) {
+      addLog('已取消丢弃筛选结果。', 'compact');
+      return;
+    }
+    let successCount = 0;
+    const failedItems = [];
+    for (const equipment of equipments) {
+      if (!state.isRunning) break;
+      try {
+        const payload = await destroyEquipment(equipment.id);
+        if (payload.success === false) throw new Error(payload.message || '丢弃失败');
+        successCount += 1;
+        state.equipmentFilterResults = state.equipmentFilterResults.filter((item) => item.id !== equipment.id);
+        renderEquipmentFilterResults();
+        addLog(`已丢弃筛选结果：${getEquipmentDisplayName(equipment)}`, 'compact');
+        await wait(getSpeedDelay());
+      } catch (error) {
+        failedItems.push({ equipment, error });
+        addLog(`${getEquipmentDisplayName(equipment)} 丢弃失败：${error.message || error}`, 'error');
+      }
+    }
+    setEquipmentFilterSummary(`筛选结果丢弃完成：成功 ${successCount}/${equipments.length} 件，剩余 ${state.equipmentFilterResults.length} 件。`);
+    addLog(`筛选结果丢弃完成：成功 ${successCount}/${equipments.length} 件${failedItems.length ? `，失败 ${failedItems.length} 件` : ''}。`, failedItems.length ? 'warn' : 'success');
+  };
+
   /**
    * destroyAllFracturedEquipments 串行丢弃当前模态框中的全部破裂装备。
    * 操作前会二次确认，避免误删。
@@ -18611,6 +18676,10 @@
     state.ui.equipmentFilterAffixTierSelect = createSelect([], '');
     state.ui.equipmentFilterAffixTierSelect.multiple = true;
     state.ui.equipmentFilterAffixTierSelect.size = 5;
+    state.ui.equipmentFilterBatchStoneSelect = createSelect(BATCH_STONE_OPTIONS.map((option) => ({
+      value: option.type,
+      label: option.label,
+    })), MODIFY_TYPES.chance);
     state.ui.equipmentFilterSummary = createElement('div', {
       className: 'poe2-summary poe2-wide',
       textContent: '尚未筛选装备',
@@ -18628,10 +18697,14 @@
 
     const filterButton = createButton('开始筛选', () => runTask('筛选装备', runEquipmentFilter));
     filterButton.classList.add('poe2-success-button');
+    const applyCurrencyButton = createButton('对结果使用通货', () => runTask('筛选结果批量通货', applyCurrencyToEquipmentFilterResults));
+    applyCurrencyButton.classList.add('poe2-success-button');
+    const destroyResultsButton = createButton('丢弃筛选结果', () => runTask('丢弃筛选结果', destroyEquipmentFilterResults));
+    destroyResultsButton.classList.add('poe2-stop');
     const clearButton = createButton('清空结果', clearEquipmentFilterResults);
     state.ui.stopButtons = state.ui.stopButtons || {};
     state.ui.stopButtons.equipmentFilter = createStopTaskButton();
-    state.ui.taskButtons?.push(filterButton);
+    state.ui.taskButtons?.push(filterButton, applyCurrencyButton, destroyResultsButton);
     renderEquipmentFilterResults();
 
     return createElement('div', {
@@ -18654,11 +18727,18 @@
             createLabeledControl('词缀位置', state.ui.equipmentFilterPositionSelect),
             createLabeledControl('词缀类型', state.ui.equipmentFilterAffixTypeSelect),
             createLabeledControl('详细词缀', state.ui.equipmentFilterAffixTierSelect, 'poe2-affix-tier-field'),
+            createLabeledControl('结果通货', state.ui.equipmentFilterBatchStoneSelect),
           ],
         }),
         createElement('div', {
           className: 'poe2-actions poe2-affix-actions',
-          children: [filterButton, state.ui.stopButtons.equipmentFilter, clearButton],
+          children: [
+            filterButton,
+            applyCurrencyButton,
+            destroyResultsButton,
+            state.ui.stopButtons.equipmentFilter,
+            clearButton,
+          ],
         }),
         state.ui.equipmentFilterSummary,
         state.ui.equipmentFilterResultList,
