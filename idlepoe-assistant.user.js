@@ -15168,6 +15168,9 @@
       setEquipmentFilterSummary(`正在扫描 ${getEquipmentFilterLocationLabel(options.location)}：第 ${page}/${totalPages} 页，初筛 ${summaryCandidates.length} 件。`);
     }
     const needsDetail = options.affixConditionGroups.length || options.corruptedBase !== 'any';
+    if (needsDetail) {
+      addLog(`正在对初筛出的 ${summaryCandidates.length} 件装备逐件请求详细数据。`, 'compact');
+    }
     const detailResults = needsDetail
       ? await runConcurrentTasks(summaryCandidates, EQUIPMENT_FILTER_CONFIG.detailConcurrency, async (equipment) => {
         const detail = await fetchEquipmentDetail(equipment.id);
@@ -18189,6 +18192,9 @@
       state.ui.affixEquipmentSelect.value,
       state.ui.affixPositionSelect.value,
     ), '选择词缀等级');
+    if (state.ui.affixTierSelect.options.length === 1) {
+      state.ui.affixTierSelect.options[0].selected = true;
+    }
   };
 
   const getSpecialConditionMetricOptions = () => Object.entries(SPECIAL_CONDITION_METRICS)
@@ -18889,6 +18895,9 @@
       state.ui.equipmentFilterEquipmentSelect?.value || '',
       state.ui.equipmentFilterPositionSelect?.value || '',
     ), '选择详细词缀');
+    if (state.ui.equipmentFilterAffixTierSelect.options.length === 1) {
+      state.ui.equipmentFilterAffixTierSelect.options[0].selected = true;
+    }
   };
 
   const clearEquipmentFilterResults = () => {
