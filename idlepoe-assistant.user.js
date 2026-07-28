@@ -353,6 +353,15 @@
   };
 
   /**
+   * EQUIPMENT_FILTER_CONFIG 控制只读装备筛选页的分页和详情并发。
+   * 筛选只读取背包/储藏，不执行改造、丢弃或存储操作。
+   */
+  const EQUIPMENT_FILTER_CONFIG = {
+    pageSize: 100,
+    detailConcurrency: 5,
+  };
+
+  /**
    * CHARACTER_EQUIPMENT_SLOT_LABELS 把角色详情中的装备槽位 key 映射为中文。
    * 同时兼容 bodyArmour/bodyArmor 两种可能拼写，提升接口字段变化时的容错能力。
    */
@@ -2793,6 +2802,8 @@
     mailCurrencyPreviewTimer: null,
     /** fracturedEquipments 保存最近一次扫描到的背包破裂装备列表。 */
     fracturedEquipments: [],
+    /** equipmentFilterResults 保存最近一次只读筛选命中的装备列表。 */
+    equipmentFilterResults: [],
     /** battleAnalysis 保存轻量战斗分析的连接状态和实时统计。 */
     battleAnalysis: {
       isConnected: false,
@@ -14732,6 +14743,192 @@
     }
   };
 
+  const getEquipmentFilterLocationLabel = (locationValue) => (locationValue === 'storage' ? '储藏' : '背包');
+
+  const getEquipmentFilterCorruptedLabel = (equipment) => (isEquipmentCorrupted(equipment) ? '已腐化' : '未腐化');
+
+  const getEquipmentFilterCorruptedBaseLabel = (equipment) => (getCorruptedBaseSignature(equipment) ? '有腐化基底' : '无腐化基底');
+
+  const getEquipmentFilterAffixSummary = (equipment) => {
+    const affixes = Array.isArray(equipment?.affixes) ? equipment.affixes : [];
+    if (!affixes.length) return '无词缀明细';
+    return affixes
+      .slice(0, 8)
+      .map((affix) => `${formatAffixPositionName(affix?.type)} ${affix?.name || affix?.affixName || '未知词缀'}`)
+      .join('；');
+  };
+
+  const fetchEquipmentFilterPage = async ({ page, location, keyword }) => {
+    const pageSize = EQUIPMENT_FILTER_CONFIG.pageSize;
+    const searchParams = new URLSearchParams({
+      keyword: keyword || '',
+      pageSize: String(pageSize),
+      _: String(Date.now()),
+    });
+    if (location === 'storage') searchParams.set('storage', 'true');
+    const payload = await requestJson(`${config.endpoints.backpack}/${page}?${searchParams.toString()}`);
+    if (payload.success === false) {
+      throw new Error(payload.message || `装备筛选第 ${page} 页读取失败`);
+    }
+    const data = payload.data || {};
+    const items = Array.isArray(data.items) ? data.items : [];
+    return {
+      items: items.map((item) => ({
+        ...item,
+        assistantSourceLocation: item.assistantSourceLocation || location,
+      })),
+      total: Number(data.total || 0),
+      pageSize: Math.max(1, items.length || pageSize),
+    };
+  };
+
+  const buildEquipmentFilterAffixConditions = () => {
+    const selectedOptions = Array.from(state.ui.equipmentFilterAffixTierSelect?.selectedOptions || []);
+    if (!selectedOptions.length) return [];
+    const conditions = selectedOptions
+      .map((option) => normalizeAffixCondition({
+        name: option.value,
+        affixType: option.dataset.affixType || state.ui.equipmentFilterAffixTypeSelect?.value || '',
+        affixId: option.dataset.affixId,
+        craftId: option.dataset.craftId,
+      }))
+      .filter((condition) => condition.name || condition.craftId);
+    return conditions.length ? [{ minRequired: 1, conditions }] : [];
+  };
+
+  const readEquipmentFilterOptions = () => {
+    const equipmentType = state.ui.equipmentFilterEquipmentSelect?.value || '';
+    return {
+      location: state.ui.equipmentFilterLocationSelect?.value || 'backpack',
+      keyword: String(state.ui.equipmentFilterKeywordInput?.value || '').trim(),
+      equipmentType,
+      equipmentTypeMask: getAffixPickerEquipmentMask(equipmentType),
+      corrupted: state.ui.equipmentFilterCorruptedSelect?.value || 'any',
+      corruptedBase: state.ui.equipmentFilterCorruptedBaseSelect?.value || 'any',
+      affixConditionGroups: buildEquipmentFilterAffixConditions(),
+    };
+  };
+
+  const isEquipmentFilterSummaryMatched = (equipment, options) => {
+    if (options.equipmentTypeMask && !isEquipmentTypeMaskMatched(equipment, options.equipmentTypeMask)) return false;
+    if (options.corrupted === 'yes' && !isEquipmentCorrupted(equipment)) return false;
+    if (options.corrupted === 'no' && isEquipmentCorrupted(equipment)) return false;
+    return true;
+  };
+
+  const isEquipmentFilterDetailMatched = (equipment, options) => {
+    if (options.corruptedBase === 'yes' && !getCorruptedBaseSignature(equipment)) return false;
+    if (options.corruptedBase === 'no' && getCorruptedBaseSignature(equipment)) return false;
+    if (options.affixConditionGroups.length && !isAffixMatched(equipment, options.affixConditionGroups)) return false;
+    return true;
+  };
+
+  const renderEquipmentFilterResults = () => {
+    const listElement = state.ui.equipmentFilterResultList;
+    if (!listElement) return;
+    const results = state.equipmentFilterResults || [];
+    if (!results.length) {
+      listElement.replaceChildren(createElement('div', {
+        className: 'poe2-empty',
+        textContent: '暂无匹配装备。',
+      }));
+      return;
+    }
+    listElement.replaceChildren(...results.map((equipment, index) => {
+      const locationLabel = getEquipmentFilterLocationLabel(equipment.assistantSourceLocation);
+      const titleText = `${index + 1}. ${getEquipmentDisplayName(equipment)}${equipment.baseName ? ` / ${equipment.baseName}` : ''}`;
+      const detailButton = createButton('查看详情', async () => {
+        try {
+          const freshEquipment = await fetchEquipmentDetail(equipment.id);
+          const detailEquipment = freshEquipment ? normalizeEquipment({
+            ...equipment,
+            ...freshEquipment,
+            id: freshEquipment.id || equipment.id,
+            assistantSourceLocation: equipment.assistantSourceLocation,
+          }) : equipment;
+          await openPageEquipmentDetailModal(detailEquipment);
+        } catch (error) {
+          addLog(`${getEquipmentDisplayName(equipment)} 查看详情失败：${error.message || error}`, 'error');
+        }
+      });
+      return createElement('div', {
+        className: 'poe2-fractured-item',
+        children: [
+          createElement('div', {
+            className: 'poe2-fractured-head',
+            children: [
+              createElement('div', {
+                className: 'poe2-fractured-name-wrap',
+                children: [
+                  createElement('div', { className: 'poe2-fractured-name', textContent: titleText }),
+                  createElement('div', {
+                    className: 'poe2-fractured-meta',
+                    textContent: `${locationLabel} · 物等 ${equipment.itemLevel || '?'} · ${getEquipmentFilterCorruptedLabel(equipment)} · ${getEquipmentFilterCorruptedBaseLabel(equipment)}`,
+                  }),
+                ],
+              }),
+              createElement('div', { className: 'poe2-actions poe2-utility-actions', children: [detailButton] }),
+            ],
+          }),
+          createElement('div', {
+            className: 'poe2-fractured-affixes',
+            children: [
+              createElement('div', {
+                className: 'poe2-fractured-affix',
+                textContent: getEquipmentFilterAffixSummary(equipment),
+              }),
+            ],
+          }),
+        ],
+      });
+    }));
+  };
+
+  const setEquipmentFilterSummary = (text) => {
+    if (state.ui.equipmentFilterSummary) state.ui.equipmentFilterSummary.textContent = text;
+  };
+
+  const runEquipmentFilter = async () => {
+    const options = readEquipmentFilterOptions();
+    state.equipmentFilterResults = [];
+    renderEquipmentFilterResults();
+    setEquipmentFilterSummary('正在扫描装备...');
+    const firstPage = await fetchEquipmentFilterPage({ page: 1, location: options.location, keyword: options.keyword });
+    const totalPages = Math.max(1, Math.ceil(firstPage.total / firstPage.pageSize));
+    const summaryCandidates = [];
+    for (let page = 1; state.isRunning && page <= totalPages; page += 1) {
+      const pageResult = page === 1
+        ? firstPage
+        : await fetchEquipmentFilterPage({ page, location: options.location, keyword: options.keyword });
+      const matchedItems = pageResult.items
+        .map(normalizeEquipment)
+        .filter((equipment) => equipment.id)
+        .filter((equipment) => isEquipmentFilterSummaryMatched(equipment, options));
+      summaryCandidates.push(...matchedItems);
+      setEquipmentFilterSummary(`正在扫描 ${getEquipmentFilterLocationLabel(options.location)}：第 ${page}/${totalPages} 页，初筛 ${summaryCandidates.length} 件。`);
+    }
+    const needsDetail = options.affixConditionGroups.length || options.corruptedBase !== 'any';
+    const detailResults = needsDetail
+      ? await runConcurrentTasks(summaryCandidates, EQUIPMENT_FILTER_CONFIG.detailConcurrency, async (equipment) => {
+        const detail = await fetchEquipmentDetail(equipment.id);
+        const detailedEquipment = normalizeEquipment({
+          ...equipment,
+          ...(detail || {}),
+          id: detail?.id || equipment.id,
+          assistantSourceLocation: equipment.assistantSourceLocation,
+        });
+        return isEquipmentFilterDetailMatched(detailedEquipment, options) ? detailedEquipment : null;
+      })
+      : summaryCandidates;
+    state.equipmentFilterResults = detailResults
+      .filter((result) => result && !result.error)
+      .map((result) => (result?.id ? result : null))
+      .filter(Boolean);
+    renderEquipmentFilterResults();
+    setEquipmentFilterSummary(`筛选完成：匹配 ${state.equipmentFilterResults.length} / 初筛 ${summaryCandidates.length} 件，扫描 ${firstPage.total} 件。`);
+    addLog(`装备筛选完成：${getEquipmentFilterLocationLabel(options.location)}匹配 ${state.equipmentFilterResults.length} 件。`, 'compact');
+  };
+
   /**
    * destroyAllFracturedEquipments 串行丢弃当前模态框中的全部破裂装备。
    * 操作前会二次确认，避免误删。
@@ -18216,6 +18413,11 @@
         children: [sections.uniqueItemCatalogSection],
       },
       {
+        id: 'equipmentFilter',
+        label: '筛选装备',
+        children: [sections.equipmentFilterSection],
+      },
+      {
         id: 'skillStones',
         label: '技能石',
         children: [sections.skillStoneSection],
@@ -18334,6 +18536,121 @@
           className: 'poe2-actions poe2-affix-actions poe2-utility-actions',
           children: [openModalButton, removeStoredStonesButton, destroyTailPagesButton, state.ui.stopButtons.other, balanceChanceScouringButton, balanceAltAugButton],
         }),
+      ],
+    });
+  };
+
+  const refreshEquipmentFilterPositionSelect = () => {
+    const equipmentType = state.ui.equipmentFilterEquipmentSelect?.value || '';
+    setSelectOptions(state.ui.equipmentFilterPositionSelect, getAffixPositionOptions(equipmentType), '选择词缀位置');
+    setSelectOptions(state.ui.equipmentFilterAffixTypeSelect, [], '选择词缀类型');
+    setSelectOptions(state.ui.equipmentFilterAffixTierSelect, [], '选择详细词缀');
+  };
+
+  const refreshEquipmentFilterAffixTypeSelect = () => {
+    const equipmentType = state.ui.equipmentFilterEquipmentSelect?.value || '';
+    const affixPosition = state.ui.equipmentFilterPositionSelect?.value || '';
+    setSelectOptions(state.ui.equipmentFilterAffixTypeSelect, getAffixTypeOptions(equipmentType, affixPosition), '选择词缀类型');
+    setSelectOptions(state.ui.equipmentFilterAffixTierSelect, [], '选择详细词缀');
+  };
+
+  const refreshEquipmentFilterAffixTierSelect = () => {
+    const selectedOption = state.ui.equipmentFilterAffixTypeSelect?.selectedOptions?.[0];
+    const affixTypeName = state.ui.equipmentFilterAffixTypeSelect?.value || '';
+    const maxLevel = Number(selectedOption?.dataset?.maxLevel || 0);
+    setSelectOptions(state.ui.equipmentFilterAffixTierSelect, getAffixTierOptions(
+      affixTypeName,
+      maxLevel,
+      state.ui.equipmentFilterEquipmentSelect?.value || '',
+      state.ui.equipmentFilterPositionSelect?.value || '',
+    ), '选择详细词缀');
+  };
+
+  const clearEquipmentFilterResults = () => {
+    state.equipmentFilterResults = [];
+    setEquipmentFilterSummary('尚未筛选装备');
+    renderEquipmentFilterResults();
+  };
+
+  /**
+   * createEquipmentFilterSection 创建只读装备筛选主菜单。
+   * @returns {HTMLElement} 装备筛选区域 DOM。
+   */
+  const createEquipmentFilterSection = () => {
+    state.ui.equipmentFilterLocationSelect = createSelect([
+      { value: 'backpack', label: '背包' },
+      { value: 'storage', label: '储藏' },
+    ], 'backpack');
+    state.ui.equipmentFilterKeywordInput = createElement('input', {
+      className: 'poe2-input',
+      placeholder: '装备名/基底关键词，可留空',
+    });
+    state.ui.equipmentFilterEquipmentSelect = createSelect([], '');
+    state.ui.equipmentFilterCorruptedSelect = createSelect([
+      { value: 'any', label: '不限' },
+      { value: 'yes', label: '已腐化' },
+      { value: 'no', label: '未腐化' },
+    ], 'any');
+    state.ui.equipmentFilterCorruptedBaseSelect = createSelect([
+      { value: 'any', label: '不限' },
+      { value: 'yes', label: '有腐化基底' },
+      { value: 'no', label: '无腐化基底' },
+    ], 'any');
+    state.ui.equipmentFilterPositionSelect = createSelect([], '');
+    state.ui.equipmentFilterAffixTypeSelect = createSelect([], '');
+    state.ui.equipmentFilterAffixTierSelect = createSelect([], '');
+    state.ui.equipmentFilterAffixTierSelect.multiple = true;
+    state.ui.equipmentFilterAffixTierSelect.size = 5;
+    state.ui.equipmentFilterSummary = createElement('div', {
+      className: 'poe2-summary poe2-wide',
+      textContent: '尚未筛选装备',
+    });
+    state.ui.equipmentFilterResultList = createElement('div', {
+      className: 'poe2-fractured-list poe2-wide',
+    });
+    setSelectOptions(state.ui.equipmentFilterEquipmentSelect, getAffixEquipmentOptions(), '不限装备类型');
+    setSelectOptions(state.ui.equipmentFilterPositionSelect, [], '选择词缀位置');
+    setSelectOptions(state.ui.equipmentFilterAffixTypeSelect, [], '选择词缀类型');
+    setSelectOptions(state.ui.equipmentFilterAffixTierSelect, [], '选择详细词缀');
+    state.ui.equipmentFilterEquipmentSelect.addEventListener('change', refreshEquipmentFilterPositionSelect);
+    state.ui.equipmentFilterPositionSelect.addEventListener('change', refreshEquipmentFilterAffixTypeSelect);
+    state.ui.equipmentFilterAffixTypeSelect.addEventListener('change', refreshEquipmentFilterAffixTierSelect);
+
+    const filterButton = createButton('开始筛选', () => runTask('筛选装备', runEquipmentFilter));
+    filterButton.classList.add('poe2-success-button');
+    const clearButton = createButton('清空结果', clearEquipmentFilterResults);
+    state.ui.stopButtons = state.ui.stopButtons || {};
+    state.ui.stopButtons.equipmentFilter = createStopTaskButton();
+    state.ui.taskButtons?.push(filterButton);
+    renderEquipmentFilterResults();
+
+    return createElement('div', {
+      className: 'poe2-section',
+      children: [
+        createElement('div', { className: 'poe2-section-title', textContent: '筛选装备' }),
+        createElement('div', {
+          className: 'poe2-summary',
+          textContent: '只读扫描背包或储藏装备，支持装备类型、腐化状态、详细词缀和腐化基底筛选。',
+        }),
+        createElement('div', {
+          className: 'poe2-grid poe2-affix-picker-grid',
+          children: [
+            createLabeledControl('读取位置', state.ui.equipmentFilterLocationSelect),
+            createLabeledControl('关键词', state.ui.equipmentFilterKeywordInput),
+            createLabeledControl('装备类型', state.ui.equipmentFilterEquipmentSelect),
+            createLabeledControl('是否腐化', state.ui.equipmentFilterCorruptedSelect),
+            createLabeledControl('腐化基底', state.ui.equipmentFilterCorruptedBaseSelect),
+            createLabeledControl('词缀位置', state.ui.equipmentFilterPositionSelect),
+            createLabeledControl('词缀类型', state.ui.equipmentFilterAffixTypeSelect),
+            createLabeledControl('详细词缀', state.ui.equipmentFilterAffixTierSelect, 'poe2-affix-tier-field'),
+          ],
+        }),
+        createElement('div', {
+          className: 'poe2-actions poe2-affix-actions',
+          children: [filterButton, state.ui.stopButtons.equipmentFilter, clearButton],
+        }),
+        state.ui.equipmentFilterSummary,
+        state.ui.equipmentFilterResultList,
       ],
     });
   };
@@ -18813,7 +19130,7 @@
       .poe2-header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#1f2937;color:#fff;cursor:move}
       .poe2-title{font-weight:700}
       .poe2-tabs{display:flex;flex-direction:column;min-height:0}
-      .poe2-tab-list{display:grid;grid-template-columns:repeat(7,1fr);gap:0;border-bottom:1px solid #cfd6e2;background:#eef2f7}
+      .poe2-tab-list{display:grid;grid-template-columns:repeat(8,1fr);gap:0;border-bottom:1px solid #cfd6e2;background:#eef2f7}
       .poe2-tab-button{height:38px;border:0;border-right:1px solid #cfd6e2;background:#eef2f7;color:#374151;font-size:13px;cursor:pointer}
       .poe2-tab-button:last-child{border-right:0}
       .poe2-tab-button.active{background:#fff;color:#1d4ed8;font-weight:700;box-shadow:inset 0 -2px 0 #315fba}
@@ -20104,6 +20421,7 @@
       commonSection,
       craftPlanSection: state.ui.craftPlanSection,
       skillStoneSection: createSkillStoneSection(),
+      equipmentFilterSection: createEquipmentFilterSection(),
       systemManagementSection: createSystemManagementSection(),
       assistantBehaviorSection: createAssistantBehaviorSection(),
       equipmentUtilitySection: createEquipmentUtilitySection(),
@@ -20147,12 +20465,19 @@
       state.ui.affixPositionSelect,
       state.ui.affixTypeSelect,
       state.ui.affixTierSelect,
+      state.ui.equipmentFilterEquipmentSelect,
+      state.ui.equipmentFilterPositionSelect,
+      state.ui.equipmentFilterAffixTypeSelect,
+      state.ui.equipmentFilterAffixTierSelect,
     ].filter(Boolean);
     pickerControls.forEach((control) => { control.disabled = true; });
     try {
       await ensureCraftBenchList();
       if (state.ui.affixEquipmentSelect?.value && state.ui.affixPositionSelect?.value) {
         refreshAffixTypeSelect(true);
+      }
+      if (state.ui.equipmentFilterEquipmentSelect?.value && state.ui.equipmentFilterPositionSelect?.value) {
+        refreshEquipmentFilterAffixTypeSelect();
       }
       const appendedCount = Object.values(state.craftBench.affixPickerByEquipment || {})
         .flatMap((positionData) => Object.values(positionData || {}))
