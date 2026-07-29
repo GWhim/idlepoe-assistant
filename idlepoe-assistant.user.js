@@ -13,6 +13,7 @@
 (() => {
   'use strict';
 
+  // Webhook sync verification: harmless comment-only change for Greasy Fork update testing.
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
 
