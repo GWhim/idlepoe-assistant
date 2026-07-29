@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         idlepoe 助手测试服版 2.23
 // @namespace    https://idlepoe.com
-// @version      2.23.3.2
+// @version      2.23.3.3
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @match        *://poe-test.faith.wang/*
 // @grant        GM_addStyle
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.23.3.2';
+  const ASSISTANT_PATCH_VERSION = '2.23.3.3';
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
 
@@ -9586,11 +9586,12 @@
     if (!source) return undefined;
     const affixes = (Array.isArray(equipment?.affixes) ? equipment.affixes : [])
       .filter((affix) => source.affixTypes.includes(Number(affix?.type)))
+      .filter((affix) => !isFracturedAffix(affix))
       .filter((affix) => !source.craftedOnly || affix?.isCrafted === true);
     if (!affixes.length) {
       const metricLabel = ROLL_CONDITION_METRICS[metric]?.label || metric;
       const targetText = source.craftedOnly ? '工艺词缀' : '前后缀';
-      throw new Error(`${equipment?.name || '当前装备'} 没有可计算“${metricLabel}”的${targetText}，已停止自动化打造。`);
+      throw new Error(`${equipment?.name || '当前装备'} 没有可计算“${metricLabel}”的${targetText}（已自动排除破裂词缀），已停止自动化打造。`);
     }
     const percentages = affixes.flatMap((affix) => calculateAffixRollPercentages(equipment, affix));
     if (!percentages.length) {
