@@ -6131,10 +6131,14 @@
     const text = [
       craft?.label,
       craft?.text,
+      craft?.name,
+      craft?.description,
+      craft?.effectText,
       craft?.affix?.name,
+      craft?.affix?.displayName,
       craft?.searchText,
     ].map((value) => String(value || '').trim()).filter(Boolean).join(' ');
-    return /随机重铸稀有物品上的(?:1|3)条词缀/.test(text);
+    return /随机重掷稀有物品上的\s*(?:1|3)\s*条词缀/.test(text);
   };
 
   const isCraftBenchForMask = (craft, mask) => {
@@ -6323,6 +6327,9 @@
   const formatCraftBenchLabel = (craft) => {
     if (!craft) return '未选择工艺';
     if (craft.text) return String(craft.text);
+    if (craft.label && craft.label !== '未选择工艺') return String(craft.label);
+    if (craft.name) return String(craft.name);
+    if (craft.description) return String(craft.description);
     const affix = craft.affix || {};
     const positionText = Number(affix.type) === 1 ? '前缀' : (Number(affix.type) === 2 ? '后缀' : '词缀');
     const magicTexts = Object.entries(affix.magics || {})
@@ -6351,7 +6358,7 @@
     if (payload.success === false) throw new Error(payload.message || '工艺列表读取失败');
     const craftList = Array.isArray(payload.data) ? payload.data : [];
     state.craftBench.list = craftList
-      .filter((craft) => craft?.affix || Number(craft?.craftId) === 0)
+      .filter((craft) => craft?.affix || isUniversalCraftBenchCraft(craft) || Number(craft?.craftId) === 0)
       .map(normalizeCraftBenchItem)
       .sort((left, right) => left.label.localeCompare(right.label) || left.craftId - right.craftId);
     state.craftBench.affixPickerByEquipment = buildCraftAffixPickerOverlay();
@@ -18358,7 +18365,10 @@
     const affixType = String(affixPosition || '').includes('前') ? 1 : String(affixPosition || '').includes('后') ? 2 : 0;
     if (!equipmentMask || !affixType) return [];
     return (Array.isArray(state.craftBench?.list) ? state.craftBench.list : [])
-      .filter((craft) => craft?.affix && Number(craft.affix.type || 0) === affixType)
+      .filter((craft) => (
+        isUniversalCraftBenchCraft(craft)
+        || (craft?.affix && Number(craft.affix.type || 0) === affixType)
+      ))
       .filter((craft) => isCraftBenchForMask(craft, equipmentMask));
   };
 
