@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         idlepoe 助手测试服版 2.23
 // @namespace    https://idlepoe.com
-// @version      2.23
+// @version      2.23.3.1
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @match        *://poe-test.faith.wang/*
 // @grant        GM_addStyle
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  // Webhook sync verification: harmless comment-only change for Greasy Fork update testing.
+  const ASSISTANT_PATCH_VERSION = '2.23.3.1';
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
 
@@ -2117,6 +2117,7 @@
     { value: 'belts', label: '腰带', mask: EQUIPMENT_TYPE_MASKS.belts },
     { value: 'amulets', label: '项链', mask: EQUIPMENT_TYPE_MASKS.amulets },
     { value: 'rings', label: '戒指', mask: EQUIPMENT_TYPE_MASKS.rings },
+    { value: 'jewels', label: '珠宝', mask: EQUIPMENT_TYPE_MASKS.jewels },
   ];
 
   const GARDEN_CRAFT_CATEGORY_OPTIONS = [
@@ -6084,11 +6085,64 @@
     }
   };
 
+  const CRAFT_EQUIPMENT_TYPE_LABEL_MASKS = new Map([
+    ['单手剑', 1n],
+    ['单手斧', 2n],
+    ['法杖', 4n],
+    ['爪', 8n],
+    ['匕首', 16n],
+    ['细剑', 32n],
+    ['单手锤', 64n],
+    ['短杖', 128n],
+    ['符文匕首', 256n],
+    ['弓', EQUIPMENT_TYPE_MASKS.bows],
+    ['长杖', 1024n],
+    ['双手剑', 2048n],
+    ['双手斧', 4096n],
+    ['双手锤', 8192n],
+    ['战杖', 16384n],
+    ['箭袋', EQUIPMENT_TYPE_MASKS.quivers],
+    ['头部', EQUIPMENT_TYPE_MASKS.helmets],
+    ['头盔', EQUIPMENT_TYPE_MASKS.helmets],
+    ['胸甲', EQUIPMENT_TYPE_MASKS.bodyArmours],
+    ['手套', EQUIPMENT_TYPE_MASKS.gloves],
+    ['鞋子', EQUIPMENT_TYPE_MASKS.boots],
+    ['靴子', EQUIPMENT_TYPE_MASKS.boots],
+    ['盾牌', EQUIPMENT_TYPE_MASKS.shields],
+    ['腰带', EQUIPMENT_TYPE_MASKS.belts],
+    ['项链', EQUIPMENT_TYPE_MASKS.amulets],
+    ['戒指', EQUIPMENT_TYPE_MASKS.rings],
+    ['珠宝', EQUIPMENT_TYPE_MASKS.jewels],
+  ]);
+
+  const getCraftEquipmentTypeMask = (value) => {
+    const numericMask = parseEquipmentTypeMask(value);
+    if (numericMask) return numericMask;
+    const text = String(value || '').trim().replace(/\(.*/, '');
+    if (!text) return 0n;
+    if (CRAFT_EQUIPMENT_TYPE_LABEL_MASKS.has(text)) return CRAFT_EQUIPMENT_TYPE_LABEL_MASKS.get(text);
+    for (const [label, mask] of CRAFT_EQUIPMENT_TYPE_LABEL_MASKS.entries()) {
+      if (text.includes(label)) return mask;
+    }
+    return 0n;
+  };
+
+  const isUniversalCraftBenchCraft = (craft) => {
+    const text = [
+      craft?.label,
+      craft?.text,
+      craft?.affix?.name,
+      craft?.searchText,
+    ].map((value) => String(value || '').trim()).filter(Boolean).join(' ');
+    return /随机重铸稀有物品上的(?:1|3)条词缀/.test(text);
+  };
+
   const isCraftBenchForMask = (craft, mask) => {
     if (!mask) return true;
+    if (isUniversalCraftBenchCraft(craft)) return true;
     if (!Array.isArray(craft?.equipmentTypes) || !craft.equipmentTypes.length) return true;
     return craft.equipmentTypes.some((equipmentType) => (
-      (parseEquipmentTypeMask(equipmentType) & mask) !== 0n
+      (getCraftEquipmentTypeMask(equipmentType) & mask) !== 0n
     ));
   };
 
@@ -16214,13 +16268,13 @@
 
   /**
    * togglePositionAdjustMode 切换外部悬浮入口按钮的调位模式。
-   * 调位模式开启后可拖动“助手 2.23”按钮；再次点击关闭并保留当前位置。
+   * 调位模式开启后可拖动“助手 ${ASSISTANT_PATCH_VERSION}”按钮；再次点击关闭并保留当前位置。
    */
   const togglePositionAdjustMode = () => {
     state.isTogglePositionMode = !state.isTogglePositionMode;
     state.ui.toggleButton?.classList.toggle('poe2-toggle-positioning', state.isTogglePositionMode);
     if (state.isTogglePositionMode) {
-      addLog('已开启调整位置模式：拖动外部“助手 2.23”按钮即可改变入口位置，再次点击“调整位置”关闭。', 'compact');
+      addLog(`已开启调整位置模式：拖动外部“助手 ${ASSISTANT_PATCH_VERSION}”按钮即可改变入口位置，再次点击“调整位置”关闭。`, 'compact');
     } else {
       addLog('已关闭调整位置模式，外部入口按钮位置已保存。', 'compact');
     }
@@ -21203,7 +21257,7 @@
    * buildUserInterface 创建主按钮、主面板和所有控件。
    */
   const buildUserInterface = () => {
-    const toggleButton = createButton('助手 2.23', () => {
+    const toggleButton = createButton(`助手 ${ASSISTANT_PATCH_VERSION}`, () => {
       state.isPanelVisible = !state.isPanelVisible;
       syncPanelVisibility();
     });
@@ -21228,7 +21282,7 @@
     const headerElement = createElement('div', {
       className: 'poe2-header',
       children: [
-        createElement('div', { className: 'poe2-title', textContent: '助手测试服版 2.23' }),
+        createElement('div', { className: 'poe2-title', textContent: `助手测试服版 ${ASSISTANT_PATCH_VERSION}` }),
         collapseButton,
       ],
     });
@@ -22314,7 +22368,7 @@
     buildUserInterface();
     addLog('正在加载工艺词缀数据…', 'compact');
     await initializeCraftAffixPickerData();
-    addLog('助手 2.23 已加载。', 'compact');
+    addLog(`助手 ${ASSISTANT_PATCH_VERSION} 已加载。`, 'compact');
     void initializeGardenCraftData();
     try {
       const importStatusText = sessionStorage.getItem(SKILL_TREE_IMPORT_STATUS_SESSION_KEY);
