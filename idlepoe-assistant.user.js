@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         idlepoe 助手测试服版 2.23
 // @namespace    https://idlepoe.com
-// @version      2.23.9.1
+// @version      2.23.9.2
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @match        *://poe-test.faith.wang/*
 // @grant        GM_addStyle
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.23.9.1';
+  const ASSISTANT_PATCH_VERSION = '2.23.9.2';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -10934,7 +10934,7 @@
   const parseEquipmentTypeMask = (value) => {
     if (value === undefined || value === null || value === '') return 0n;
     const label = String(value).trim();
-    if (CRAFT_EQUIPMENT_TYPE_LABEL_MASKS[label]) return CRAFT_EQUIPMENT_TYPE_LABEL_MASKS[label];
+    if (AFFIX_PICKER_EQUIPMENT_MASKS[label]) return AFFIX_PICKER_EQUIPMENT_MASKS[label];
     try {
       return BigInt(label);
     } catch (error) {
