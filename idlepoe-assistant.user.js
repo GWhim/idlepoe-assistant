@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         idlepoe 助手测试服版 2.24
 // @namespace    https://idlepoe.com
-// @version      2.24.1
+// @version      2.24.1.1
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
+// @author       天哪!是GPT大人
 // @match        *://poe-test.faith.wang/*
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
@@ -13,7 +14,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.24.1';
+  const ASSISTANT_PATCH_VERSION = '2.24.1.1';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -2018,6 +2019,12 @@
       limits: { prefix: 3, suffix: 3, total: 6 },
       requiresConditions: false,
     },
+    catalyst: {
+      label: '催化剂',
+      currencyLabel: '催化剂',
+      limits: { prefix: 3, suffix: 3, total: 6 },
+      requiresConditions: false,
+    },
     scouring: {
       label: '重铸石',
       currencyLabel: '重铸石',
@@ -2108,6 +2115,7 @@
     { value: 'currency', label: '使用通货' },
     { value: 'craftBench', label: '工艺' },
     { value: 'gardenCraft', label: '花园工艺' },
+    { value: 'catalyst', label: '催化剂' },
     { value: 'aggregate', label: '智能操作' },
     { value: 'condition', label: '条件判断' },
     { value: 'none', label: '无动作' },
@@ -2216,8 +2224,7 @@
     {
       value: 'weapons',
       label: '武器',
-      mask: EQUIPMENT_TYPE_MASKS.oneHandWeapons | EQUIPMENT_TYPE_MASKS.twoHandWeapons | EQUIPMENT_TYPE_MASKS.bows,
-      sampleTypes: [1n],
+      mask: EQUIPMENT_TYPE_MASKS.oneHandWeapons | 4n | EQUIPMENT_TYPE_MASKS.twoHandWeapons | EQUIPMENT_TYPE_MASKS.bows,
     },
     {
       value: 'armours',
@@ -2227,15 +2234,37 @@
         | EQUIPMENT_TYPE_MASKS.gloves
         | EQUIPMENT_TYPE_MASKS.boots
         | EQUIPMENT_TYPE_MASKS.shields,
-      sampleTypes: [17179869184n],
     },
     {
       value: 'jewelry',
       label: '项链/戒指/腰带',
       mask: EQUIPMENT_TYPE_MASKS.amulets | EQUIPMENT_TYPE_MASKS.rings | EQUIPMENT_TYPE_MASKS.belts,
-      sampleTypes: [EQUIPMENT_TYPE_MASKS.amulets],
     },
   ];
+
+  const GARDEN_CRAFT_STARTUP_REQUESTS = [
+    { categoryValue: 'weapons', equipmentType: 1n },
+    // 134217728 是力量胸甲。护甲品质附魔只会随胸甲列表返回；
+    // 之前误用了 17179869184（力量头盔），导致整个护甲分类缓存缺少 8 条胸甲附魔。
+    { categoryValue: 'armours', equipmentType: 134217728n },
+    { categoryValue: 'jewelry', equipmentType: EQUIPMENT_TYPE_MASKS.amulets },
+  ];
+
+  // FPOE 当前把这 8 条品质附魔的 equipmentTypes 错标成仅胸甲；游戏规则按通用护甲处理。
+  const GARDEN_ARMOUR_QUALITY_ENCHANT_IDS = new Set([
+    'LifeBodyEnchant',
+    'ManaBodyEnchant',
+    'StrengthBodyEnchant',
+    'DexterityBodyEnchant',
+    'IntelligenceBodyEnchant',
+    'FireResistBodyEnchant',
+    'ColdResistBodyEnchant',
+    'LightningResistBodyEnchant',
+  ]);
+  const GARDEN_ARMOUR_QUALITY_ENCHANT_MASK = EQUIPMENT_TYPE_MASKS.helmets
+    | EQUIPMENT_TYPE_MASKS.bodyArmours
+    | EQUIPMENT_TYPE_MASKS.gloves
+    | EQUIPMENT_TYPE_MASKS.boots;
 
   /**
    * CONTINUOUS_STEP_HANDLINGS 定义连续打造步骤条件成立/不成立后的处理方式。
@@ -7204,6 +7233,7 @@
     'vaal',
     'fracturing',
     'chance',
+    'catalyst',
   ]);
 
   const SHARE_STEP_HANDLING_ENUM = createShareEnum([
@@ -7504,6 +7534,8 @@
     requestCooldownUntil: 0,
     /** requestQueueTail 把所有 FPOE API 请求接入同一条串行队列。 */
     requestQueueTail: Promise.resolve(),
+    /** nextRequestAllowedAt 统一限制自动化任务中两次 API 请求的最小间隔。 */
+    nextRequestAllowedAt: 0,
     /** practiceSkillStoneCache 保存加载技能石时同步获得的练习孔位缓存，调整位置时不再重复查询。 */
     practiceSkillStoneCache: {
       loaded: false,
@@ -7616,7 +7648,14 @@
     /** gardenCraft 保存花园工艺列表缓存，选项来自游戏前端同款 /equipment/garden/list 接口。 */
     gardenCraft: {
       byCategory: {},
-      loadingByCategory: {},
+      byEquipmentType: {},
+      startupInitialized: false,
+      startupLoadingPromise: null,
+    },
+    /** catalyst 保存独立催化剂接口按装备类型返回的列表缓存。 */
+    catalyst: {
+      byCategory: {},
+      byEquipmentType: {},
     },
     /** isTogglePositionMode 表示外部悬浮入口按钮是否处于拖动调位模式。 */
     isTogglePositionMode: false,
@@ -7676,6 +7715,8 @@
       craftApply: `${API_BASE_URL}/craft`,
       gardenList: `${API_BASE_URL}/equipment/garden/list`,
       gardenApply: `${API_BASE_URL}/equipment/garden/apply`,
+      catalystList: `${API_BASE_URL}/equipment/catalyst/list`,
+      catalystApply: `${API_BASE_URL}/equipment/catalyst/apply`,
       battleWs: `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/battle/ws`,
       rankLevel: `${API_BASE_URL}/rank/level`,
       characterView: `${API_BASE_URL}/character/view`,
@@ -7999,8 +8040,13 @@
     });
     await previousRequest.catch(() => {});
     try {
+      if (state.isRunning) {
+        const remainingDelayMs = Math.max(0, Number(state.nextRequestAllowedAt || 0) - Date.now());
+        if (remainingDelayMs > 0) await wait(remainingDelayMs);
+      }
       return await requestWorker();
     } finally {
+      state.nextRequestAllowedAt = state.isRunning ? Date.now() + getSpeedDelay() : 0;
       releaseRequest();
     }
   };
@@ -8289,7 +8335,7 @@
   }
 
   const BATTLE_BINARY_MAGIC = 1;
-  const BATTLE_BINARY_VERSIONS = new Set([7, 8]);
+  const BATTLE_BINARY_VERSION = 9;
   const BATTLE_BINARY_TYPES = {
     1: 'battle_init',
     2: 'battle_event',
@@ -8384,6 +8430,34 @@
       chargesPerUse: chargesPerUse[index],
       isActive: activeValues[index],
       chargePercent: chargePercents[index],
+    }));
+  };
+
+  /** @param {BattleBinaryReader} reader 二进制 reader。 */
+  const readBattleTinctureList = (reader) => {
+    const length = reader.u32();
+    const slotIndexes = new Array(length);
+    const baseIds = new Array(length);
+    const names = new Array(length);
+    const activeValues = new Array(length);
+    const manaBurnStacks = new Array(length);
+    const cooldownRemainingSeconds = new Array(length);
+    const lingerRemainingSeconds = new Array(length);
+    for (let index = 0; index < length; index += 1) slotIndexes[index] = reader.i32();
+    for (let index = 0; index < length; index += 1) baseIds[index] = reader.str();
+    for (let index = 0; index < length; index += 1) names[index] = reader.str();
+    for (let index = 0; index < length; index += 1) activeValues[index] = reader.bool();
+    for (let index = 0; index < length; index += 1) manaBurnStacks[index] = reader.i32();
+    for (let index = 0; index < length; index += 1) cooldownRemainingSeconds[index] = reader.f64();
+    for (let index = 0; index < length; index += 1) lingerRemainingSeconds[index] = reader.f64();
+    return slotIndexes.map((slotIndex, index) => ({
+      slotIndex,
+      baseId: baseIds[index],
+      name: names[index],
+      isActive: activeValues[index],
+      manaBurnStacks: manaBurnStacks[index],
+      cooldownRemainingSeconds: cooldownRemainingSeconds[index],
+      lingerRemainingSeconds: lingerRemainingSeconds[index],
     }));
   };
 
@@ -8559,6 +8633,7 @@
     const righteousFireRanges = new Array(length);
     const buffs = new Array(length);
     const flasks = new Array(length);
+    const tinctures = new Array(length);
     for (let index = 0; index < length; index += 1) indexes[index] = reader.i32();
     for (let index = 0; index < length; index += 1) removedValues[index] = reader.bool();
     for (let index = 0; index < length; index += 1) names[index] = reader.str();
@@ -8577,6 +8652,7 @@
     for (let index = 0; index < length; index += 1) righteousFireRanges[index] = reader.f32();
     for (let index = 0; index < length; index += 1) buffs[index] = readBattleBuffList(reader);
     for (let index = 0; index < length; index += 1) flasks[index] = readBattleFlaskList(reader);
+    for (let index = 0; index < length; index += 1) tinctures[index] = readBattleTinctureList(reader);
     return indexes.map((unitIndex, index) => ({
       index: unitIndex,
       removed: removedValues[index],
@@ -8596,6 +8672,7 @@
       righteousFireRangeMeters: righteousFireRanges[index],
       buffs: buffs[index],
       flasks: flasks[index],
+      tinctures: tinctures[index],
     }));
   };
 
@@ -8609,8 +8686,10 @@
     const buffCounts = new Array(length);
     const buffs = new Array(length);
     const flasks = new Array(length);
+    const tinctures = new Array(length);
     const hasBuffs = new Array(length);
     const hasFlasks = new Array(length);
+    const hasTinctures = new Array(length);
     for (let index = 0; index < length; index += 1) indexes[index] = reader.i32();
     for (let index = 0; index < length; index += 1) fields[index] = reader.u16();
     for (let index = 0; index < length; index += 1) removedValues[index] = reader.bool();
@@ -8624,6 +8703,10 @@
       hasFlasks[index] = reader.bool();
       flasks[index] = hasFlasks[index] ? readBattleFlaskList(reader) : null;
     }
+    for (let index = 0; index < length; index += 1) {
+      hasTinctures[index] = reader.bool();
+      tinctures[index] = hasTinctures[index] ? readBattleTinctureList(reader) : null;
+    }
     return indexes.map((unitIndex, index) => ({
       index: unitIndex,
       fields: fields[index],
@@ -8632,6 +8715,7 @@
       buffUpdatesCount: buffCounts[index],
       buffs: buffs[index],
       flasks: flasks[index],
+      tinctures: tinctures[index],
     }));
   };
 
@@ -8775,8 +8859,8 @@
   });
 
   /** @param {BattleBinaryReader} reader 二进制 reader。 */
-  const readBattleCastGeometry = (reader, protocolVersion) => {
-    if (protocolVersion < 8 || !reader.bool()) return null;
+  const readBattleCastGeometry = (reader) => {
+    if (!reader.bool()) return null;
     return {
       originX: reader.f64(),
       originY: reader.f64(),
@@ -8785,7 +8869,7 @@
   };
 
   /** @param {BattleBinaryReader} reader 二进制 reader。 */
-  const readBattleEvent = (reader, protocolVersion) => {
+  const readBattleEvent = (reader) => {
     const frame = {
       battleId: reader.str(),
       time: reader.f64(),
@@ -8801,7 +8885,7 @@
     };
     if (reader.bool()) frame.impactX = reader.f64();
     if (reader.bool()) frame.impactY = reader.f64();
-    const castGeometry = readBattleCastGeometry(reader, protocolVersion);
+    const castGeometry = readBattleCastGeometry(reader);
     if (castGeometry) frame.castGeometry = castGeometry;
     frame.splashRadiusMeters = reader.f64();
     frame.splashStartIndex = reader.i32();
@@ -8824,7 +8908,7 @@
     frame.leftTeamAuras = readOptionalBattleSkillList(reader);
     frame.rightTeamAuras = readOptionalBattleSkillList(reader);
     frame.fullState = reader.bool();
-    frame.events = Array.from({ length: reader.u32() }, () => readBattleEvent(reader, protocolVersion));
+    frame.events = Array.from({ length: reader.u32() }, () => readBattleEvent(reader));
     frame.activeProjectiles = readBattleActiveProjectiles(reader);
     return frame;
   };
@@ -8838,11 +8922,11 @@
       if (!type) return null;
       const reader = new BattleBinaryReader(bytes.subarray(2));
       const protocolVersion = reader.u8();
-      if (!BATTLE_BINARY_VERSIONS.has(protocolVersion)) return null;
+      if (protocolVersion !== BATTLE_BINARY_VERSION) return null;
       let data = null;
       if (type === 'battle_init') {
         data = { battleId: reader.str(), leftTeam: readBattleSimpleTeam(reader), rightTeam: readBattleSimpleTeam(reader) };
-      } else if (type === 'battle_event') data = readBattleEvent(reader, protocolVersion);
+      } else if (type === 'battle_event') data = readBattleEvent(reader);
       else if (type === 'battle_result') data = readBattleResult(reader);
       else if (type === 'monster_drop') data = readBattleMonsterDrop(reader);
       else if (type === 'battle_searching') data = { time: reader.f64() };
@@ -11426,33 +11510,49 @@
 
   const formatGardenCraftLabel = (craft) => {
     if (!craft) return '未选择花园工艺';
-    const prefix = craft.type === 'catalyst' ? '催化剂' : '附魔';
     const nameText = craft.name || craft.description || craft.key;
-    const catalystEffect = craft.type === 'catalyst'
-      ? getCatalystEffectLabel(craft.catalystType ?? craft.currencyType)
-      : '';
-    return `${prefix}：${stripHtmlText(nameText)}${catalystEffect ? `（${catalystEffect}）` : ''}`;
+    return stripHtmlText(nameText);
   };
 
   const normalizeGardenCraftItem = (item) => {
-    const type = item?.type === 'catalyst' ? 'catalyst' : 'enchantment';
-    const idValue = type === 'catalyst' ? item?.currencyType : item?.enchantmentId;
-    const key = `${type}:${idValue}`;
+    const craftId = String(item?.craftId || '').trim();
     const description = stripHtmlText(item?.description || '');
-    const normalized = {
+    return {
       ...item,
-      type,
-      key,
-      label: formatGardenCraftLabel({ ...item, type, key }),
+      craftId,
+      key: craftId,
+      runtimeSupported: item?.runtimeSupported !== false,
+      label: formatGardenCraftLabel({ ...item, key: craftId }),
       searchText: [
-        key,
+        craftId,
         item?.name || '',
         description,
       ].join(' '),
     };
-    if (type === 'catalyst') normalized.catalystType = Number(item?.currencyType);
-    if (type === 'enchantment') normalized.enchantmentId = Number(item?.enchantmentId);
-    return normalized;
+  };
+
+  const normalizeCatalystItem = (item) => {
+    const catalystType = Number(item?.currencyType ?? item?.catalystType);
+    const effectLabel = getCatalystEffectLabel(catalystType);
+    const rawName = stripHtmlText(item?.name || `催化剂 ${catalystType}`).replace(/^应用/, '');
+    const description = stripHtmlText(item?.description || '');
+    return {
+      ...item,
+      catalystType,
+      key: String(catalystType),
+      label: `${rawName}${effectLabel ? `（${effectLabel}）` : ''}`,
+      searchText: [String(catalystType), rawName, description, effectLabel].join(' '),
+    };
+  };
+
+  const normalizeEquipmentTypeCacheKey = (equipmentTypeMask) => {
+    const mask = parseEquipmentTypeMask(equipmentTypeMask);
+    return mask > 0n ? mask.toString() : '';
+  };
+
+  const isGardenOrCatalystEquipmentType = (equipmentTypeMask) => {
+    const mask = parseEquipmentTypeMask(equipmentTypeMask);
+    return GARDEN_CRAFT_CATEGORY_OPTIONS.some((category) => (mask & category.mask) !== 0n);
   };
 
   const fetchGardenCraftRawList = async (equipmentTypeMask) => {
@@ -11460,63 +11560,98 @@
       noRetryHttpStatuses: [400],
     });
     if (payload.success === false) throw new Error(payload.message || '花园工艺列表读取失败');
-    const data = payload.data || {};
-    return [
-      ...(Array.isArray(data.enchantments) ? data.enchantments.map((item) => ({ ...item, type: 'enchantment' })) : []),
-      ...(Array.isArray(data.catalysts) ? data.catalysts.map((item) => ({ ...item, type: 'catalyst' })) : []),
-    ];
+    return Array.isArray(payload.data?.crafts) ? payload.data.crafts : [];
   };
 
-  const isInvalidGardenCraftEquipmentTypeError = (error) => (
-    /无效的装备类型|invalid equipment type/i.test(String(error?.message || error || ''))
-  );
+  const fetchCatalystRawList = async (equipmentTypeMask) => {
+    const payload = await requestJson(`${config.endpoints.catalystList}/${equipmentTypeMask.toString()}?_=${Date.now()}`, {
+      noRetryHttpStatuses: [400],
+    });
+    if (payload.success === false) throw new Error(payload.message || '催化剂列表读取失败');
+    return Array.isArray(payload.data) ? payload.data : [];
+  };
 
-  const fetchGardenCraftRawListFromSamples = async (category) => {
-    const byKey = new Map();
-    let successfulRequestCount = 0;
-    let lastInvalidTypeError = null;
-    for (const sampleType of category.sampleTypes || []) {
+  const normalizeGardenCraftList = (items) => (Array.isArray(items) ? items : [])
+    .map(normalizeGardenCraftItem)
+    .filter((item) => item.key && item.runtimeSupported)
+    .sort((left, right) => left.label.localeCompare(right.label) || left.key.localeCompare(right.key));
+
+  const normalizeCatalystList = (items) => (Array.isArray(items) ? items : [])
+    .map(normalizeCatalystItem)
+    .filter((item) => item.key && Number.isFinite(item.catalystType))
+    .sort((left, right) => left.catalystType - right.catalystType);
+
+  const preloadGardenAndCatalystData = async () => {
+    let gardenFailureCount = 0;
+    let catalystFailureCount = 0;
+    for (const requestConfig of GARDEN_CRAFT_STARTUP_REQUESTS) {
+      const { categoryValue, equipmentType } = requestConfig;
+      const cacheKey = normalizeEquipmentTypeCacheKey(equipmentType);
       try {
-        const sampleItems = await fetchGardenCraftRawList(sampleType);
-        successfulRequestCount += 1;
-        sampleItems.forEach((item) => {
-          const normalizedItem = normalizeGardenCraftItem(item);
-          if (normalizedItem.key) byKey.set(normalizedItem.key, item);
-        });
+        const list = normalizeGardenCraftList(
+          await fetchGardenCraftRawList(equipmentType),
+        );
+        state.gardenCraft.byCategory[categoryValue] = list;
+        state.gardenCraft.byEquipmentType[cacheKey] = list;
       } catch (error) {
-        if (!isInvalidGardenCraftEquipmentTypeError(error)) throw error;
-        lastInvalidTypeError = error;
+        state.gardenCraft.byCategory[categoryValue] = [];
+        state.gardenCraft.byEquipmentType[cacheKey] = [];
+        gardenFailureCount += 1;
+        addLog(`启动加载${getGardenCraftCategory(categoryValue).label}花园工艺失败，本次将保持不可用：${error.message}`, 'warn');
       }
     }
-    if (successfulRequestCount === 0 && lastInvalidTypeError) throw lastInvalidTypeError;
-    return [...byKey.values()];
-  };
-
-  const fetchGardenCraftListByCategory = async (categoryValue) => {
-    const category = getGardenCraftCategory(categoryValue);
-    const rawItems = await fetchGardenCraftRawListFromSamples(category);
-    const list = rawItems
-      .map(normalizeGardenCraftItem)
-      .filter((item) => item.key && (item.type === 'catalyst' ? Number.isFinite(item.catalystType) : Number.isFinite(item.enchantmentId)))
-      .sort((left, right) => left.label.localeCompare(right.label) || left.key.localeCompare(right.key));
-    state.gardenCraft.byCategory[category.value] = list;
-    return list;
-  };
-
-  const ensureGardenCraftList = async (categoryValue, forceRefresh = false) => {
-    const category = getGardenCraftCategory(categoryValue);
-    if (state.gardenCraft.loadingByCategory[category.value] && !forceRefresh) {
-      return state.gardenCraft.loadingByCategory[category.value];
-    }
-    if (state.gardenCraft.byCategory[category.value] && !forceRefresh) {
-      return state.gardenCraft.byCategory[category.value];
-    }
-    state.gardenCraft.loadingByCategory[category.value] = fetchGardenCraftListByCategory(category.value);
+    const catalystEquipmentType = EQUIPMENT_TYPE_MASKS.amulets;
+    const catalystCacheKey = normalizeEquipmentTypeCacheKey(catalystEquipmentType);
     try {
-      return await state.gardenCraft.loadingByCategory[category.value];
-    } finally {
-      delete state.gardenCraft.loadingByCategory[category.value];
+      const list = normalizeCatalystList(await fetchCatalystRawList(catalystEquipmentType));
+      state.catalyst.byCategory.jewelry = list;
+      state.catalyst.byEquipmentType[catalystCacheKey] = list;
+    } catch (error) {
+      state.catalyst.byCategory.jewelry = [];
+      state.catalyst.byEquipmentType[catalystCacheKey] = [];
+      catalystFailureCount = 1;
+      addLog(`启动加载催化剂失败，本次将保持不可用：${error.message}`, 'warn');
     }
+    state.gardenCraft.startupInitialized = true;
+    return {
+      gardenRequestCount: GARDEN_CRAFT_STARTUP_REQUESTS.length,
+      catalystRequestCount: 1,
+      gardenFailureCount,
+      catalystFailureCount,
+    };
+  };
+
+  const ensureGardenAndCatalystStartupData = () => {
+    if (state.gardenCraft.startupLoadingPromise) return state.gardenCraft.startupLoadingPromise;
+    if (state.gardenCraft.startupInitialized) return Promise.resolve(null);
+    state.gardenCraft.startupLoadingPromise = preloadGardenAndCatalystData();
+    return state.gardenCraft.startupLoadingPromise;
+  };
+
+  const ensureGardenCraftList = async (categoryValue) => {
+    const category = getGardenCraftCategory(categoryValue);
+    await ensureGardenAndCatalystStartupData();
+    return state.gardenCraft.byCategory[category.value] || [];
+  };
+
+  const ensureCatalystList = async (categoryValue = 'jewelry') => {
+    const category = getGardenCraftCategory(categoryValue);
+    await ensureGardenAndCatalystStartupData();
+    return state.catalyst.byCategory[category.value] || [];
+  };
+
+  const ensureGardenCraftListForEquipmentType = async (equipmentTypeMask) => {
+    const cacheKey = normalizeEquipmentTypeCacheKey(equipmentTypeMask);
+    if (!cacheKey || !isGardenOrCatalystEquipmentType(equipmentTypeMask)) return [];
+    await ensureGardenAndCatalystStartupData();
+    return getGardenCraftsByEquipmentType(equipmentTypeMask);
+  };
+
+  const ensureCatalystListForEquipmentType = async (equipmentTypeMask) => {
+    const cacheKey = normalizeEquipmentTypeCacheKey(equipmentTypeMask);
+    if (!cacheKey || !isGardenOrCatalystEquipmentType(equipmentTypeMask)) return [];
+    await ensureGardenAndCatalystStartupData();
+    return getCatalystsByEquipmentType(equipmentTypeMask);
   };
 
   const getGardenCraftOptionsByCategory = (categoryValue) => (
@@ -11526,10 +11661,64 @@
     label: craft.label,
   }));
 
+  const getCatalystOptionsByCategory = (categoryValue = 'jewelry') => (
+    state.catalyst.byCategory[getGardenCraftCategory(categoryValue).value] || []
+  ).map((catalyst) => ({ value: catalyst.key, label: catalyst.label }));
+
+  const isGardenCraftApplicableToEquipmentType = (craft, equipmentTypeMask) => {
+    const mask = parseEquipmentTypeMask(equipmentTypeMask);
+    if (GARDEN_ARMOUR_QUALITY_ENCHANT_IDS.has(String(craft?.craftId || ''))) {
+      return (mask & GARDEN_ARMOUR_QUALITY_ENCHANT_MASK) !== 0n;
+    }
+    const supportedMasks = Array.isArray(craft?.equipmentTypes)
+      ? craft.equipmentTypes.map(parseEquipmentTypeMask).filter((value) => value > 0n)
+      : [];
+    return mask > 0n && (!supportedMasks.length || supportedMasks.some((value) => (mask & value) !== 0n));
+  };
+
+  const getGardenCraftsByEquipmentType = (equipmentTypeMask, enchantmentsOnly = false) => {
+    const mask = parseEquipmentTypeMask(equipmentTypeMask);
+    const category = GARDEN_CRAFT_CATEGORY_OPTIONS.find((item) => (mask & item.mask) !== 0n);
+    let list = category
+      ? (state.gardenCraft.byCategory[category.value] || [])
+        .filter((craft) => isGardenCraftApplicableToEquipmentType(craft, mask))
+      : [];
+    if (category?.value === 'weapons' && (mask & ~(4n | EQUIPMENT_TYPE_MASKS.bows)) === 0n) {
+      list = list.filter((craft) => craft.craftId !== 'WeaponRangeEnchant');
+    }
+    return enchantmentsOnly ? list.filter((craft) => craft.kind === 'enchantment') : list;
+  };
+
+  const getCatalystsByEquipmentType = (equipmentTypeMask) => {
+    const mask = parseEquipmentTypeMask(equipmentTypeMask);
+    const jewelryMask = EQUIPMENT_TYPE_MASKS.belts | EQUIPMENT_TYPE_MASKS.amulets | EQUIPMENT_TYPE_MASKS.rings;
+    return (mask & jewelryMask) !== 0n ? (state.catalyst.byCategory.jewelry || []) : [];
+  };
+
   const getGardenCraftByKey = (categoryValue, gardenCraftKey) => {
     const normalizedKey = String(gardenCraftKey || '');
     return (state.gardenCraft.byCategory[getGardenCraftCategory(categoryValue).value] || [])
       .find((craft) => craft.key === normalizedKey) || null;
+  };
+
+  const getCatalystByKey = (categoryValue, catalystKey) => {
+    const normalizedKey = String(catalystKey || '');
+    return (state.catalyst.byCategory[getGardenCraftCategory(categoryValue).value] || [])
+      .find((catalyst) => catalyst.key === normalizedKey) || null;
+  };
+
+  const findLoadedGardenCraftByKey = (gardenCraftKey) => {
+    const normalizedKey = String(gardenCraftKey || '');
+    return [...Object.values(state.gardenCraft.byEquipmentType), ...Object.values(state.gardenCraft.byCategory)]
+      .flat()
+      .find((craft) => craft.key === normalizedKey) || null;
+  };
+
+  const findLoadedCatalystByKey = (catalystKey) => {
+    const normalizedKey = String(catalystKey || '');
+    return [...Object.values(state.catalyst.byEquipmentType), ...Object.values(state.catalyst.byCategory)]
+      .flat()
+      .find((catalyst) => catalyst.key === normalizedKey) || null;
   };
 
   const isGardenCraftForEquipment = (categoryValue, equipment, fallbackEquipmentTypeMask = 0n) => {
@@ -11544,14 +11733,15 @@
     await ensureGardenCraftList(category.value);
     const craft = getGardenCraftByKey(category.value, gardenCraftKey);
     if (!craft) throw new Error('请先选择花园工艺方法。');
-    if (!isGardenCraftForEquipment(category.value, equipment, options.equipmentTypeMask)) {
-      throw new Error(`${equipment.name} 的装备类型不能使用该花园工艺分组：${category.label}。`);
+    const equipmentTypeMask = parseEquipmentTypeMask(getEquipmentTypeValueForFilter(equipment))
+      || parseEquipmentTypeMask(options.equipmentTypeMask);
+    if (!isGardenCraftForEquipment(category.value, equipment, options.equipmentTypeMask)
+      || !isGardenCraftApplicableToEquipmentType(craft, equipmentTypeMask)) {
+      throw new Error(`${equipment.name} 的装备类型不能使用该花园工艺：${craft.label}。`);
     }
     recordStepExecution('花园工艺');
     addMainLog(`${equipment.name} 使用花园工艺：${craft.label}。`);
-    const body = craft.type === 'catalyst'
-      ? { type: 'catalyst', equipmentId: equipment.id, catalystType: craft.catalystType }
-      : { type: 'enchantment', equipmentId: equipment.id, enchantmentId: craft.enchantmentId };
+    const body = { equipmentId: equipment.id, craftId: craft.craftId };
     const payload = await requestJson(config.endpoints.gardenApply, { method: 'POST', body });
     if (payload.success === false) throw new Error(payload.message || '花园工艺失败');
     const updatedEquipment = payload.data?.equipment || payload.data;
@@ -11560,7 +11750,56 @@
     recordCurrencyUsageBatch(cost);
     const costText = formatCraftBenchCost(cost);
     addLog(`${equipment.name} 已使用花园工艺：${craft.label}${costText ? `，消耗：${costText}` : ''}。`, 'info');
-    await wait(getSpeedDelay());
+    return true;
+  };
+
+  const applyGardenCraftForEquipmentType = async (equipment, equipmentTypeMask, gardenCraftKey) => {
+    await ensureGardenCraftListForEquipmentType(equipmentTypeMask);
+    const craft = getGardenCraftsByEquipmentType(equipmentTypeMask)
+      .find((item) => item.key === String(gardenCraftKey || '')) || null;
+    if (!craft) throw new Error('请先选择适用于该装备的花园工艺。');
+    recordStepExecution('花园工艺');
+    addMainLog(`${equipment.name} 使用花园工艺：${craft.label}。`);
+    const payload = await requestJson(config.endpoints.gardenApply, {
+      method: 'POST',
+      body: { equipmentId: equipment.id, craftId: craft.craftId },
+    });
+    if (payload.success === false) throw new Error(payload.message || '花园工艺失败');
+    const updatedEquipment = payload.data?.equipment || payload.data;
+    if (updatedEquipment) mergeEquipmentUpdate(equipment, updatedEquipment);
+    const cost = craft.cost || payload.data?.cost || {};
+    recordCurrencyUsageBatch(cost);
+    const costText = formatCraftBenchCost(cost);
+    addLog(`${equipment.name} 已使用花园工艺：${craft.label}${costText ? `，消耗：${costText}` : ''}。`, 'info');
+    return true;
+  };
+
+  const applyCatalyst = async (equipment, catalystKey, options = {}) => {
+    const equipmentTypeMask = parseEquipmentTypeMask(getEquipmentTypeValueForFilter(equipment))
+      || parseEquipmentTypeMask(options.equipmentTypeMask);
+    let catalyst = null;
+    if (equipmentTypeMask) {
+      await ensureCatalystListForEquipmentType(equipmentTypeMask);
+      catalyst = getCatalystsByEquipmentType(equipmentTypeMask)
+        .find((item) => item.key === String(catalystKey || '')) || null;
+      if (!catalyst) throw new Error(`${equipment.name} 不能使用所选催化剂。`);
+    } else {
+      await ensureCatalystList('jewelry');
+      catalyst = getCatalystByKey('jewelry', catalystKey);
+    }
+    if (!catalyst) throw new Error('请先选择催化剂。');
+    recordStepExecution('催化剂');
+    addMainLog(`${equipment.name} 使用催化剂：${catalyst.label}。`);
+    const payload = await requestJson(config.endpoints.catalystApply, {
+      method: 'POST',
+      body: { equipmentId: equipment.id, catalystType: catalyst.catalystType },
+    });
+    if (payload.success === false) throw new Error(payload.message || '催化剂使用失败');
+    const updatedEquipment = payload.data?.equipment || payload.data;
+    if (updatedEquipment) mergeEquipmentUpdate(equipment, updatedEquipment);
+    const cost = catalyst.cost || payload.data?.cost || {};
+    recordCurrencyUsageBatch(cost);
+    addLog(`${equipment.name} 已使用催化剂：${catalyst.label}。`, 'info');
     return true;
   };
 
@@ -11606,7 +11845,6 @@
     } catch (error) {
       if (!continueOnBackendRejection) throw error;
       addLog(`${equipment.name} 存在多大师工艺，已尝试工艺但被后端拒绝：${error.message}；继续执行后续步骤。`, 'warn');
-      await wait(getSpeedDelay());
       return false;
     }
     const updatedEquipment = payload.data?.equipment || payload.data;
@@ -11614,7 +11852,6 @@
     const cost = getCraftBenchCost(craft, equipment);
     recordCurrencyUsageBatch(cost);
     addLog(`${equipment.name} 已使用工艺：${craft.label}${formatCraftBenchCost(cost) ? `，消耗：${formatCraftBenchCost(cost)}` : ''}。`, 'info');
-    await wait(getSpeedDelay());
     return true;
   };
 
@@ -11661,7 +11898,6 @@
     const hasSameCraft = hasSameCraftBenchAffix(equipment, craft);
     if (hasSameCraft) {
       addStepLog(`${equipment.name} 已有相同工艺，智能工艺跳过：${craft.label}。`);
-      await wait(getSpeedDelay());
       return true;
     }
     const hasMultiMasterCraft = hasMultiMasterCraftAffix(equipment);
@@ -11670,18 +11906,15 @@
     if (hasMultiMasterCraft && isCraftPositionFull) {
       const positionText = craftPositionType === 'prefix' ? '前缀' : '后缀';
       addStepLog(`${equipment.name} 存在多大师工艺，但${positionText}已满，智能工艺跳过：${craft.label}。`);
-      await wait(getSpeedDelay());
       return true;
     }
     if (hasCraftedAffix(equipment) && !hasMultiMasterCraft) {
       addStepLog(`${equipment.name} 已有工艺词缀，智能工艺跳过。`);
-      await wait(getSpeedDelay());
       return true;
     }
     if (isCraftPositionFull) {
       const positionText = craftPositionType === 'prefix' ? '前缀' : '后缀';
       addStepLog(`${equipment.name} ${positionText}已满，智能工艺跳过：${craft.label}。`);
-      await wait(getSpeedDelay());
       return true;
     }
     if (hasMultiMasterCraft) addStepLog(`${equipment.name} 存在多大师工艺且${craftPositionType === 'prefix' ? '前缀' : '后缀'}仍有空位，智能工艺尝试：${craft.label}。`);
@@ -12149,7 +12382,6 @@
       if (loadedCount % 10 === 0 || loadedCount === stoneList.length) {
         addLog(`背包技能石详情串行读取进度：${loadedCount}/${stoneList.length}。`, 'info');
       }
-      if (loadedCount < stoneList.length) await wait(getSpeedDelay());
     }
     return normalizedStones;
   };
@@ -12271,7 +12503,6 @@
       if (loadedCount % 10 === 0 || loadedCount === socketStones.length) {
         addLog(`装备技能石详情串行读取进度：${loadedCount}/${socketStones.length}。`, 'info');
       }
-      if (loadedCount < socketStones.length) await wait(getSpeedDelay());
     }
     return normalizedStones;
   };
@@ -13518,6 +13749,29 @@
 
   const normalizeContinuousStepNote = (note) => String(note || '').trim().slice(0, 200);
 
+  const migrateGardenCraftSelection = (action, gardenCraftCategory, gardenCraftKey) => {
+    const rawKey = String(gardenCraftKey || '').trim();
+    const keyParts = rawKey.split('|');
+    const normalizedKey = keyParts.pop() || '';
+    const prefixedCategory = keyParts.find((part) => GARDEN_CRAFT_CATEGORY_OPTIONS.some((option) => option.value === part));
+    const catalystMatch = action === 'gardenCraft' && normalizedKey.match(/^catalyst:(\d+)$/);
+    const legacyEnchantment = action === 'gardenCraft' && /^enchantment:\d+$/.test(normalizedKey);
+    return {
+      action: catalystMatch ? 'catalyst' : action,
+      category: catalystMatch ? 'jewelry' : (prefixedCategory || gardenCraftCategory),
+      key: catalystMatch ? catalystMatch[1] : (legacyEnchantment ? '' : normalizedKey),
+      legacyEnchantment,
+    };
+  };
+
+  const getLegacyGardenCraftStepIndexes = (rawSteps) => (Array.isArray(rawSteps) ? rawSteps : [])
+    .map((step, stepIndex) => {
+      const rawKey = Array.isArray(step) ? step[9] : step?.gardenCraftKey;
+      const rawAction = Array.isArray(step) ? decodeShareStepAction(step[0]) : step?.action;
+      return rawAction === 'gardenCraft' && /(?:^|\|)enchantment:\d+$/.test(String(rawKey || '')) ? stepIndex : -1;
+    })
+    .filter((stepIndex) => stepIndex >= 0);
+
   /**
    * createContinuousCraftStep 创建连续打造步骤。
    * 每一步是比条件组更大的单位：先选择本步动作，再在本步内部自由组合多个条件组。
@@ -13539,21 +13793,23 @@
     gardenCraftCategory = GARDEN_CRAFT_CATEGORY_OPTIONS[0].value,
     gardenCraftKey = '',
   ) => {
+    const migratedGardenCraft = migrateGardenCraftSelection(action, gardenCraftCategory, gardenCraftKey);
+    const normalizedAction = migratedGardenCraft.action;
     const normalizedFailureHandling = normalizeContinuousStepHandling(failureHandling, 'scourRestart');
     const normalizedSuccessHandling = normalizeContinuousStepHandling(successHandling, 'jump');
     const normalizedCraftCategory = CRAFT_BENCH_CATEGORY_OPTIONS.some((option) => option.value === craftCategory)
       ? craftCategory
       : CRAFT_BENCH_CATEGORY_OPTIONS[0].value;
     const normalizedCraftId = Number.parseInt(craftId, 10);
-    const normalizedGardenCraftCategory = GARDEN_CRAFT_CATEGORY_OPTIONS.some((option) => option.value === gardenCraftCategory)
-      ? gardenCraftCategory
+    const normalizedGardenCraftCategory = GARDEN_CRAFT_CATEGORY_OPTIONS.some((option) => option.value === migratedGardenCraft.category)
+      ? migratedGardenCraft.category
       : GARDEN_CRAFT_CATEGORY_OPTIONS[0].value;
     return {
-      action: CONTINUOUS_CRAFT_ACTIONS[action] ? action : 'alteration',
+      action: CONTINUOUS_CRAFT_ACTIONS[normalizedAction] ? normalizedAction : 'alteration',
       craftCategory: normalizedCraftCategory,
       craftId: Number.isFinite(normalizedCraftId) ? String(normalizedCraftId) : '',
-      gardenCraftCategory: normalizedGardenCraftCategory,
-      gardenCraftKey: String(gardenCraftKey || ''),
+      gardenCraftCategory: normalizedAction === 'catalyst' ? 'jewelry' : normalizedGardenCraftCategory,
+      gardenCraftKey: migratedGardenCraft.key,
       successHandling: normalizedSuccessHandling,
       successTargetStepIndex: Number.isInteger(successTargetStepIndex) && successTargetStepIndex >= 0 ? successTargetStepIndex : null,
       failureHandling: normalizedFailureHandling,
@@ -15075,6 +15331,7 @@
     if (isRunning) {
       state.abortController = new AbortController();
       state.currentTaskStartedAt = Date.now();
+      state.nextRequestAllowedAt = 0;
       resetCurrencyUsage();
     } else {
       state.abortController = null;
@@ -15083,6 +15340,7 @@
       state.currentPage = 1;
       state.completedCount = 0;
       state.processedEquipmentIds.clear();
+      state.nextRequestAllowedAt = 0;
     }
     for (const button of state.ui.taskButtons || []) {
       button.disabled = isRunning;
@@ -15279,12 +15537,18 @@
    */
   const normalizeCraftPlan = (rawPlan) => {
     if (!rawPlan || typeof rawPlan !== 'object') return null;
-    const options = sanitizeCraftPlanOptions(rawPlan.options || rawPlan);
+    const rawOptions = rawPlan.options || rawPlan;
+    const options = sanitizeCraftPlanOptions(rawOptions);
+    const gardenCraftCompatibilitySteps = [...new Set([
+      ...(Array.isArray(rawPlan.gardenCraftCompatibilitySteps) ? rawPlan.gardenCraftCompatibilitySteps : []),
+      ...getLegacyGardenCraftStepIndexes(rawOptions.continuousCraftSteps),
+    ].map((value) => Number.parseInt(value, 10)).filter((value) => Number.isInteger(value) && value >= 0))];
     return {
       id: String(rawPlan.id || `plan-${Date.now()}`),
       name: String(rawPlan.name || '未命名方案').trim() || '未命名方案',
       updatedAt: Number(rawPlan.updatedAt || Date.now()),
       options,
+      gardenCraftCompatibilitySteps,
       legacyPartialCompatibility: rawPlan.legacyPartialCompatibility
         && Array.isArray(rawPlan.legacyPartialCompatibility.steps)
         ? {
@@ -15563,7 +15827,7 @@
     .map((step, stepIndex) => {
       const groups = compactAffixConditionGroups(step.conditionGroups, stepIndex);
       const usesCraftBenchSelection = ['craftBench', 'smartCraftBench'].includes(step.action);
-      const usesGardenCraftSelection = step.action === 'gardenCraft';
+      const usesGardenCraftSelection = ['gardenCraft', 'catalyst'].includes(step.action);
       return [
         encodeShareEnumValue(step.action, SHARE_ACTION_ENUM),
         encodeShareEnumValue(step.successHandling, SHARE_STEP_HANDLING_ENUM),
@@ -15635,6 +15899,7 @@
         continuousCraftSteps: expandContinuousCraftSteps(options.s),
         omitTargetFilters: true,
       },
+      gardenCraftCompatibilitySteps: getLegacyGardenCraftStepIndexes(options.s),
     });
     return plan;
   };
@@ -15782,7 +16047,7 @@
       };
     }
     const migratedPlan = assertCraftPlanAffixesRecognized(normalizeCraftPlan(expandedPlan));
-    if (migratedPlan.legacyPartialCompatibility?.steps?.length) {
+    if (migratedPlan.legacyPartialCompatibility?.steps?.length || migratedPlan.gardenCraftCompatibilitySteps?.length) {
       // 部分兼容只用于当前内存中的读取结果；必须保留原始 2.21 方案。
       // 后续词缀映射继续完善时，仍可从原始条件重新迁移，不能把已清空步骤反写到本地存储。
       migratedPlan.rawStoragePlan = rawPlan;
@@ -15810,7 +16075,9 @@
         + ' 与 2.24 当前词缀 ID 不兼容，请重新创建该方案。',
       );
     }
-    return assertCraftPlanAffixesRecognized(normalizeCraftPlan(expandedPlan));
+    const normalizedPlan = assertCraftPlanAffixesRecognized(normalizeCraftPlan(expandedPlan));
+    if (normalizedPlan.gardenCraftCompatibilitySteps.length) normalizedPlan.rawStoragePlan = rawPlan;
+    return normalizedPlan;
   };
 
   const ensureCraftPlansHydrated = () => {
@@ -15844,6 +16111,7 @@
     const storedPlans = state.craftPlans.map((plan) => (
       plan.storageMigrationError
       || (plan.legacyPartialCompatibility?.steps?.length && plan.rawStoragePlan)
+      || (plan.gardenCraftCompatibilitySteps?.length && plan.rawStoragePlan)
         ? plan.rawStoragePlan
         : serializeCraftPlanForStorage(plan)
     ));
@@ -15862,7 +16130,7 @@
       value: plan.id,
       label: plan.storageMigrationError
         ? `${plan.name}（无法识别，词缀已改）`
-        : plan.legacyPartialCompatibility?.steps?.length
+        : plan.legacyPartialCompatibility?.steps?.length || plan.gardenCraftCompatibilitySteps?.length
           ? `${plan.name}（部分兼容）`
           : plan.name,
     })), '选择本地方案');
@@ -16003,7 +16271,12 @@
         + `第 ${incompatibleStepNumbers.join('、')} 步的判断条件已清空，请重新设置。`,
         'warn',
       );
-    } else {
+    }
+    if (plan.gardenCraftCompatibilitySteps?.length) {
+      const stepNumbers = [...new Set(plan.gardenCraftCompatibilitySteps.map((stepIndex) => stepIndex + 1))].sort((left, right) => left - right);
+      addLog(`已部分兼容并读取自定义方案“${plan.name}”：第 ${stepNumbers.join('、')} 步的旧花园附魔已清空，请重新选择。`, 'warn');
+    }
+    if (!plan.legacyPartialCompatibility?.steps?.length && !plan.gardenCraftCompatibilitySteps?.length) {
       addLog(`已读取自定义方案：${plan.name}`, 'compact');
     }
   };
@@ -16050,7 +16323,12 @@
     setInputValue(state.ui.craftPlanNameInput, plan.name);
     applyCraftPlanOptions(plan.options);
     switchToContinuousCraftTab();
-    addLog(`已导入并读取自定义方案：${plan.name}。如需保留，请点击保存方案。`, 'compact');
+    if (plan.gardenCraftCompatibilitySteps?.length) {
+      const stepNumbers = plan.gardenCraftCompatibilitySteps.map((stepIndex) => stepIndex + 1);
+      addLog(`已部分兼容并导入自定义方案“${plan.name}”：第 ${stepNumbers.join('、')} 步的旧花园附魔已清空，请重新选择；如需保留，请点击保存方案。`, 'warn');
+    } else {
+      addLog(`已导入并读取自定义方案：${plan.name}。如需保留，请点击保存方案。`, 'compact');
+    }
   };
 
   /**
@@ -16076,7 +16354,6 @@
       }
       const equipment = equipmentQueue.shift();
       await equipmentHandler(equipment);
-      await wait(getSpeedDelay());
     }
   };
 
@@ -16635,7 +16912,6 @@
       delete equipment.corruptedMagics;
       if (equipment.raw && typeof equipment.raw === 'object') delete equipment.raw.corruptedMagics;
     }
-    await wait(getSpeedDelay());
     return payload;
   };
 
@@ -16659,7 +16935,6 @@
       const nextEquipment = getModifiedEquipmentFromPayload(payload);
       if (nextEquipment) mergeEquipmentUpdate(equipment, nextEquipment);
       useCount += 1;
-      await wait(getSpeedDelay());
     }
     if (state.isRunning && useCount >= state.stepActionSafetyLimit) {
       stopTaskForSafetyLimit(`${equipment.name} ${stoneName}已达到经典动作上限 ${state.stepActionSafetyLimit} 次，已停止所有打造。`);
@@ -16676,25 +16951,26 @@
     if (!isGardenCraftForEquipment(category.value, equipment, options.equipmentTypeMask)) {
       throw new Error(`${equipment.name} 的装备类型不能使用该花园工艺分组：${category.label}。`);
     }
-    if (craft.type !== 'catalyst') {
-      await applyGardenCraft(equipment, category.value, craft.key, options);
-      addStepLog(`${equipment.name} 花园工艺阶段完成：${craft.label} 1 次。`);
-      return;
-    }
+    await applyGardenCraft(equipment, category.value, craft.key, options);
+    addStepLog(`${equipment.name} 花园工艺阶段完成：${craft.label} 1 次。`);
+  };
+
+  const applyCatalystUntilMax = async (equipment, catalystKey, taskLabel = '自定义打造', options = {}) => {
+    if (!String(catalystKey || '').trim()) throw new Error(`请先选择${taskLabel}催化剂。`);
     let useCount = 0;
     while (state.isRunning && useCount < 20) {
       const currentQuality = Number(equipment.quality);
       if (Number.isFinite(currentQuality) && currentQuality >= EQUIPMENT_TARGET_QUALITY) break;
       try {
-        await applyGardenCraft(equipment, category.value, craft.key, options);
+        await applyCatalyst(equipment, catalystKey, options);
         useCount += 1;
       } catch (error) {
         if (!state.isRunning || isRequestAbortError(error)) throw error;
-        addStepLog(`${equipment.name} 催化剂阶段停止：${craft.label} ${useCount} 次，${error.message || error}；继续后续步骤。`);
+        addStepLog(`${equipment.name} 催化剂阶段停止：已使用 ${useCount} 次，${error.message || error}；继续后续步骤。`);
         return;
       }
     }
-    if (useCount > 0) addStepLog(`${equipment.name} 催化剂强化至上限完成：${craft.label} ${useCount} 次。`);
+    if (useCount > 0) addStepLog(`${equipment.name} 催化剂强化至上限完成：共 ${useCount} 次。`);
   };
 
   const shouldProtectHighQualityEquipment = (equipment, plan) => (
@@ -17144,7 +17420,8 @@
       actions.push(socketModes.length ? `孔洞(${socketModes.join('/')})` : '孔洞');
     }
     if (targetConfig.enableQuality) actions.push('品质');
-    if (targetConfig.enableGardenCraft) actions.push('花园');
+    if (targetConfig.enableGardenCraft) actions.push('花园附魔');
+    if (targetConfig.enableCatalyst) actions.push('催化剂');
     if (targetConfig.enableVaal) actions.push('瓦尔');
     actions.push(...getUniqueCraftResultRuleSummaryParts(targetConfig));
     return actions;
@@ -17192,27 +17469,42 @@
   };
 
   const validateUniqueCraftGardenCraftSelectionsBeforeRun = async (runnableSteps) => {
-    const checkedSelections = new Set();
+    const checkedGardenSelections = new Set();
+    const checkedCatalystSelections = new Set();
     for (const step of runnableSteps) {
       for (const [, targetConfig, item] of getUniqueCraftStepTargetEntries(step)) {
-        if (!targetConfig?.enableGardenCraft) continue;
-        const selectionValue = String(targetConfig.gardenCraftSelection || '').trim();
-        if (!selectionValue) {
-          throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已勾选花园工艺，请先选择具体花园工艺。`);
-        }
-        const { categoryValue, gardenCraftKey } = parseGardenCraftSelectionValue(selectionValue);
-        const category = getGardenCraftCategory(categoryValue);
         const targetEquipmentTypeMask = getUniqueCraftItemEquipmentTypeMask(item);
-        if (targetEquipmentTypeMask && (targetEquipmentTypeMask & category.mask) === 0n) {
-          throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 不能使用该花园工艺分组：${category.label}。`);
-        }
-        const selectionKey = `${categoryValue}|${gardenCraftKey}`;
-        if (!checkedSelections.has(selectionKey)) {
-          await ensureGardenCraftList(categoryValue);
-          if (!getGardenCraftByKey(categoryValue, gardenCraftKey)) {
-            throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已选择的花园工艺已失效，请重新选择具体花园工艺。`);
+        if (targetConfig?.enableGardenCraft) {
+          const gardenCraftKey = String(targetConfig.gardenCraftSelection || '').trim();
+          if (!gardenCraftKey) {
+            throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已勾选花园附魔，请先选择具体附魔。`);
           }
-          checkedSelections.add(selectionKey);
+          const selectionKey = `${targetEquipmentTypeMask}|${gardenCraftKey}`;
+          if (!checkedGardenSelections.has(selectionKey)) {
+            await ensureGardenCraftListForEquipmentType(targetEquipmentTypeMask);
+            const craft = getGardenCraftsByEquipmentType(targetEquipmentTypeMask, true)
+              .find((itemCraft) => itemCraft.key === gardenCraftKey);
+            if (!craft) {
+              throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已选择的花园附魔已失效或不适用于该装备，请重新选择。`);
+            }
+            checkedGardenSelections.add(selectionKey);
+          }
+        }
+        if (targetConfig?.enableCatalyst) {
+          const catalystKey = String(targetConfig.catalystSelection || '').trim();
+          if (!catalystKey) {
+            throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已勾选催化剂，请先选择具体催化剂。`);
+          }
+          const selectionKey = `${targetEquipmentTypeMask}|${catalystKey}`;
+          if (!checkedCatalystSelections.has(selectionKey)) {
+            await ensureCatalystListForEquipmentType(targetEquipmentTypeMask);
+            const catalyst = getCatalystsByEquipmentType(targetEquipmentTypeMask)
+              .find((itemCatalyst) => itemCatalyst.key === catalystKey);
+            if (!catalyst) {
+              throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已选择的催化剂已失效或不适用于该装备，请重新选择。`);
+            }
+            checkedCatalystSelections.add(selectionKey);
+          }
         }
       }
     }
@@ -17442,9 +17734,21 @@
       }
       if (!rollSkippedRest && targetConfig.enableGardenCraft && state.isRunning) {
         if (isEquipmentCorrupted(equipment)) {
-          addStepLog(`${equipment.name} 已腐化，跳过花园工艺。`);
+          addStepLog(`${equipment.name} 已腐化，跳过花园附魔。`);
         } else {
-          await applyGardenCraftUntilMax(equipment, targetConfig.gardenCraftSelection, '暗金打造', {
+          await applyGardenCraftForEquipmentType(
+            equipment,
+            getUniqueCraftItemEquipmentTypeMask(catalogItem),
+            targetConfig.gardenCraftSelection,
+          );
+          if (!state.isRunning) return buildUniqueCraftTargetResult({ stopped: true });
+        }
+      }
+      if (!rollSkippedRest && targetConfig.enableCatalyst && state.isRunning) {
+        if (isEquipmentCorrupted(equipment)) {
+          addStepLog(`${equipment.name} 已腐化，跳过催化剂。`);
+        } else {
+          await applyCatalystUntilMax(equipment, targetConfig.catalystSelection, '暗金打造', {
             equipmentTypeMask: getUniqueCraftItemEquipmentTypeMask(catalogItem),
           });
           if (!state.isRunning) return buildUniqueCraftTargetResult({ stopped: true });
@@ -17906,7 +18210,6 @@
         const success = await applyCraftCurrency(equipment, MODIFY_TYPES.jeweller, '工匠石', { failureLogType: 'info' });
         if (!success) break;
         jewellerCount += 1;
-        await wait(getSpeedDelay());
       }
       if (state.isRunning && jewellerCount >= state.stepActionSafetyLimit) {
         stopTaskForSafetyLimit(`${equipment.name} 工匠石已达到经典动作上限 ${state.stepActionSafetyLimit} 次，已停止所有打造。`);
@@ -17930,7 +18233,6 @@
           break;
         }
         addStepLog(`${equipment.name} 链接石后判断：${formatSocketSummary(socketSummary)}，尚未单组链接。`);
-        await wait(getSpeedDelay());
       }
       if (state.isRunning && fusingCount >= state.stepActionSafetyLimit) {
         stopTaskForSafetyLimit(`${equipment.name} 链接石已达到经典动作上限 ${state.stepActionSafetyLimit} 次，已停止所有打造。`);
@@ -17979,7 +18281,6 @@
       if (chromaticCount % 10 === 0) {
         addLog(`${equipment.name} 洗色 ${chromaticCount} 次：${formatSocketSummary(nextSocketSummary)}`, 'info');
       }
-      await wait(getSpeedDelay());
     }
     if (state.isRunning && chromaticCount >= state.stepActionSafetyLimit) {
       stopTaskForSafetyLimit(`${equipment.name} 幻色石已达到经典动作上限 ${state.stepActionSafetyLimit} 次，已停止所有打造。`);
@@ -18035,7 +18336,6 @@
       const nextEquipment = getModifiedEquipmentFromPayload(payload);
       if (nextEquipment) mergeEquipmentUpdate(equipment, nextEquipment);
       useCount += 1;
-      await wait(getSpeedDelay());
     }
     if (state.isRunning && useCount >= state.stepActionSafetyLimit) {
       stopTaskForSafetyLimit(`${equipment.name} ${stoneName}已达到经典动作上限 ${state.stepActionSafetyLimit} 次，已停止所有打造。`);
@@ -18059,7 +18359,6 @@
       const success = await applyCraftCurrency(equipment, MODIFY_TYPES.scouring, '重铸石');
       if (!success) throw new Error('重铸石失败，无法把装备变为普通。');
       scouringCount += 1;
-      await wait(getSpeedDelay());
     }
     if (!state.isRunning || shouldStop()) return scouringCount;
     if (Number(equipment.rarity) !== RARITY_TYPES.normal) {
@@ -18081,7 +18380,6 @@
     }
     const success = await applyCraftCurrency(equipment, MODIFY_TYPES.scouring, '重铸石');
     if (!success) throw new Error('重铸石失败，无法重新开始自定义打造。');
-    await wait(getSpeedDelay());
     if (![RARITY_TYPES.normal, RARITY_TYPES.magic].includes(Number(equipment.rarity))) {
       throw new Error(`${equipment.name} 重铸后不是普通或魔法装备，已停止以避免继续消耗重铸石。`);
     }
@@ -18099,7 +18397,6 @@
     if ([RARITY_TYPES.normal, RARITY_TYPES.magic].includes(Number(equipment.rarity))) return 0;
     const success = await applyCraftCurrency(equipment, MODIFY_TYPES.scouring, '重铸石');
     if (!success) throw new Error('重铸石失败，无法准备改造增幅底子。');
-    await wait(getSpeedDelay());
     if (![RARITY_TYPES.normal, RARITY_TYPES.magic].includes(Number(equipment.rarity))) {
       throw new Error(`${equipment.name} 重铸后不是普通或魔法装备，已停止以避免继续消耗重铸石。`);
     }
@@ -18118,7 +18415,6 @@
     if (rarity !== RARITY_TYPES.normal) {
       const success = await applyCraftCurrency(equipment, MODIFY_TYPES.scouring, '重铸石');
       if (!success) throw new Error('重铸石失败，无法准备魔法底子。');
-      await wait(getSpeedDelay());
       if (![RARITY_TYPES.normal, RARITY_TYPES.magic].includes(Number(equipment.rarity))) {
         throw new Error(`${equipment.name} 重铸后不是普通或魔法装备，已停止以避免继续消耗重铸石。`);
       }
@@ -18129,7 +18425,6 @@
     }
     const success = await applyCraftCurrency(equipment, MODIFY_TYPES.transmutation, '蜕变石');
     if (!success) throw new Error('蜕变石失败，无法变为魔法装备。');
-    await wait(getSpeedDelay());
   };
 
   const getEnsureRareCurrencyType = (equipment) => {
@@ -18152,7 +18447,6 @@
     if (currencyType === null) {
       const success = await applyCraftCurrency(equipment, MODIFY_TYPES.scouring, '重铸石');
       if (!success) throw new Error('重铸石失败，无法准备稀有底子。');
-      await wait(getSpeedDelay());
       currencyType = getEnsureRareCurrencyType(equipment);
       if (currencyType === null) {
         throw new Error(`${equipment.name} 重铸后既不是普通装备，也不是可用富豪石升级的破裂魔法装备，已停止以避免继续消耗通货。`);
@@ -18164,7 +18458,6 @@
     }
     const success = await applyCraftCurrency(equipment, currencyType, currencyName);
     if (!success) throw new Error(`${currencyName}失败，无法变为稀有装备。`);
-    await wait(getSpeedDelay());
     if (Number(equipment.rarity) !== RARITY_TYPES.rare) {
       throw new Error(`${equipment.name} 使用${currencyName}后没有变为稀有装备。`);
     }
@@ -18189,7 +18482,6 @@
       }
       if (Number(equipment.rarity) !== RARITY_TYPES.magic || !shouldUseAugment(equipment)) {
         addStepLog(`${equipment.name} 智能增幅失败后复查发现已不需要增幅，按跳过处理。`, 'warn');
-        await wait(getSpeedDelay());
         return;
       }
       addStepLog(`${equipment.name} 智能增幅失败后复查仍缺词缀，3 秒后重试一次增幅石。`, 'warn');
@@ -18197,7 +18489,6 @@
       const retrySuccess = await applyCraftCurrency(equipment, MODIFY_TYPES.augment, '增幅石');
       if (!retrySuccess) throw new Error('增幅石失败，无法执行智能增幅。');
     }
-    await wait(getSpeedDelay());
   };
 
   const smartExaltEquipment = async (equipment) => {
@@ -18214,7 +18505,6 @@
     }
     const success = await applyCraftCurrency(equipment, MODIFY_TYPES.exalted, '崇高石');
     if (!success) throw new Error('崇高石失败，无法执行智能崇高。');
-    await wait(getSpeedDelay());
   };
 
   /**
@@ -18232,7 +18522,6 @@
     if (equipment.rarity !== RARITY_TYPES.magic) {
       throw new Error(`${equipment.name} 使用蜕变石后没有变为魔法装备。`);
     }
-    await wait(getSpeedDelay());
     return 1;
   };
 
@@ -18251,7 +18540,6 @@
     if (equipment.rarity !== RARITY_TYPES.rare) {
       throw new Error(`${equipment.name} 使用点金石后没有变为稀有装备。`);
     }
-    await wait(getSpeedDelay());
     return 1;
   };
 
@@ -18270,7 +18558,6 @@
     if (equipment.rarity !== RARITY_TYPES.rare) {
       throw new Error(`${equipment.name} 使用富豪石后没有变为稀有装备。`);
     }
-    await wait(getSpeedDelay());
     return 1;
   };
 
@@ -18314,7 +18601,6 @@
       const scourEquipment = getModifiedEquipmentFromPayload(scourPayload);
       if (scourEquipment) mergeEquipmentUpdate(equipment, scourEquipment);
       scouringCount += 1;
-      await wait(getSpeedDelay());
     }
     if (state.isRunning && chanceCount >= state.stepActionSafetyLimit) {
       stopTaskForSafetyLimit(`${equipment.name} 机会石已达到经典动作上限 ${state.stepActionSafetyLimit} 次，已停止所有打造。`);
@@ -18380,78 +18666,34 @@
     addLog('自动暗金已锁定本次目标筛选快照，运行期间继续修改 UI 不会影响当前任务。', 'compact');
     let exhausted = false;
     let lockedCount = 0;
-    let dequeuePromise = Promise.resolve();
     const matchedUniqueEquipments = [];
-    const workerCount = Math.max(1, Math.min(AUTO_UNIQUE_CONCURRENCY, options.targetCount));
-    const getNextAutoUniqueEquipment = async () => {
-      const previousDequeue = dequeuePromise;
-      let releaseDequeue;
-      dequeuePromise = new Promise((resolve) => { releaseDequeue = resolve; });
-      await previousDequeue;
+    while (state.isRunning && !exhausted && state.completedCount < options.targetCount) {
+      let equipment = null;
       try {
-        if (!state.isRunning || exhausted || state.completedCount >= options.targetCount) return null;
-        return await getNextEquipment({
+        equipment = await getNextEquipment({
           ...options,
           excludeRarities: [RARITY_TYPES.unique],
         });
-      } finally {
-        releaseDequeue();
-      }
-    };
-    const runWorker = async (workerIndex) => {
-      let processedCount = 0;
-      try {
-        while (state.isRunning && !exhausted && state.completedCount < options.targetCount) {
-          let equipment = null;
-          try {
-            equipment = await getNextAutoUniqueEquipment();
-          } catch (error) {
-            if (isRequestAbortError(error)) {
-              addLog(`自动暗金 worker ${workerIndex + 1}/${workerCount} 已停止。`, 'compact');
-              return { workerIndex, processedCount, stopped: true };
-            }
-            throw error;
-          }
-          if (!equipment) {
-            if (state.isRunning && state.completedCount < options.targetCount) exhausted = true;
-            return { workerIndex, processedCount };
-          }
-          processedCount += 1;
-          lockedCount += 1;
-          addLog(`自动暗金 worker ${workerIndex + 1}/${workerCount} 锁定第 ${lockedCount} 件：${equipment.name}。`, 'compact');
-          try {
-            const result = await processChanceUnique(equipment, options.targetCount);
-            if (result?.matched && Number(result.equipment?.rarity) === RARITY_TYPES.unique) {
-              matchedUniqueEquipments.push(result.equipment);
-            }
-          } catch (error) {
-            if (isRequestAbortError(error)) {
-              addLog(`自动暗金已停止：${equipment.name} 当前请求已中断。`, 'compact');
-              return { workerIndex, processedCount, stopped: true };
-            }
-            addLog(`自动暗金处理失败：${equipment.name}，${error.message || error}`, 'warn');
-          }
-          await wait(getSpeedDelay());
-        }
-        return { workerIndex, processedCount };
-      } finally {
-        addTraceLog(`自动暗金 worker ${workerIndex + 1}/${workerCount} 已退出，处理 ${processedCount} 件。`);
-      }
-    };
-    const workerResults = [];
-    for (let workerIndex = 0; workerIndex < workerCount; workerIndex += 1) {
-      try {
-        workerResults.push({ status: 'fulfilled', value: await runWorker(workerIndex) });
       } catch (error) {
-        workerResults.push({ status: 'rejected', reason: error });
+        if (isRequestAbortError(error)) break;
+        throw error;
+      }
+      if (!equipment) {
+        exhausted = true;
+        break;
+      }
+      lockedCount += 1;
+      addLog(`自动暗金串行锁定第 ${lockedCount} 件：${equipment.name}。`, 'compact');
+      try {
+        const result = await processChanceUnique(equipment, options.targetCount);
+        if (result?.matched && Number(result.equipment?.rarity) === RARITY_TYPES.unique) {
+          matchedUniqueEquipments.push(result.equipment);
+        }
+      } catch (error) {
+        if (isRequestAbortError(error)) break;
+        addLog(`自动暗金处理失败：${equipment.name}，${error.message || error}`, 'warn');
       }
     }
-    const failedWorkers = workerResults.filter((result) => (
-      result.status === 'rejected' && !isRequestAbortError(result.reason)
-    ));
-    failedWorkers.forEach((result) => {
-      addLog(`自动暗金 worker 异常退出：${result.reason?.message || result.reason || '未知错误'}`, 'warn');
-    });
     if (exhausted && state.completedCount < options.targetCount) {
       addLog(`没有找到更多符合条件的装备，自动暗金停在 ${state.completedCount}/${options.targetCount}。`, 'warn');
     }
@@ -18472,7 +18714,6 @@
         addLog(`命中 ${state.completedCount}：${equipment.name}，混沌${attemptIndex}。`, 'success');
         return true;
       }
-      await wait(getSpeedDelay());
     }
     if (state.isRunning) {
       stopTaskForSafetyLimit(`${equipment.name} 混沌筛选已达到经典动作上限 ${state.stepActionSafetyLimit} 次，已停止所有打造。`);
@@ -18612,7 +18853,6 @@
         return { matched: true, attemptCount: attemptIndex };
       }
       addStepLog(`${equipment.name} 改造增幅第 ${attemptIndex} 轮：条件未命中。`, 'info');
-      await wait(getSpeedDelay());
     }
     if (state.isRunning) {
       stopTaskForSafetyLimit(`${equipment.name} 改造增幅已达到经典动作上限 ${maxAttempts} 次，已停止所有打造。`);
@@ -18637,8 +18877,8 @@
       if (['craftBench', 'smartCraftBench'].includes(step.action) && !step.craftId) {
         throw new Error(`${stepLabel} 需要先选择具体工艺词缀。`);
       }
-      if (step.action === 'gardenCraft' && !step.gardenCraftKey) {
-        throw new Error(`${stepLabel} 需要先选择具体花园工艺方法。`);
+      if (['gardenCraft', 'catalyst'].includes(step.action) && !step.gardenCraftKey) {
+        throw new Error(`${stepLabel} 需要先选择具体${step.action === 'catalyst' ? '催化剂' : '花园工艺方法'}。`);
       }
       if (step.action === 'conditionCheck' && conditionGroups.length) {
         assertAffixConditionsPossible(conditionGroups, actionConfig.limits, stepLabel);
@@ -18664,7 +18904,6 @@
         return { matched: true, attemptCount: attemptIndex };
       }
       addStepLog(`${equipment.name} 混沌第 ${attemptIndex} 轮：条件未命中。`, 'info');
-      await wait(getSpeedDelay());
     }
     if (state.isRunning) {
       stopTaskForSafetyLimit(`${equipment.name} 混沌石已达到经典动作上限 ${maxAttempts} 次，已停止所有打造。`);
@@ -18691,7 +18930,6 @@
         return { matched: true, attemptCount: attemptIndex };
       }
       addStepLog(`${equipment.name} ${currencyName}第 ${attemptIndex} 轮：条件未命中。`, 'info');
-      await wait(getSpeedDelay());
     }
     if (state.isRunning) {
       stopTaskForSafetyLimit(`${equipment.name} ${currencyName}已达到经典动作上限 ${maxAttempts} 次，已停止所有打造。`);
@@ -18723,7 +18961,6 @@
         addStepLog(`${equipment.name} 增幅石未执行：${augmentPayload.message || '接口返回失败'}。`);
       }
     }
-    await wait(getSpeedDelay());
   };
 
   /**
@@ -18755,13 +18992,11 @@
     if (normalizedStep.action === 'alteration') {
       const success = await applyCraftCurrency(equipment, MODIFY_TYPES.alteration, actionConfig.currencyLabel);
       if (!success) throw new Error(`${actionConfig.currencyLabel}失败`);
-      await wait(getSpeedDelay());
       return true;
     }
     if (normalizedStep.action === 'chaos') {
       const success = await applyCraftCurrency(equipment, MODIFY_TYPES.chaos, actionConfig.currencyLabel);
       if (!success) throw new Error(`${actionConfig.currencyLabel}失败`);
-      await wait(getSpeedDelay());
       return true;
     }
     if (normalizedStep.action === 'ensureMagic') {
@@ -18790,12 +19025,18 @@
       return true;
     }
     if (normalizedStep.action === 'gardenCraft') {
-      await applyGardenCraftUntilMax(
+      await applyGardenCraftForEquipmentType(
         equipment,
-        getGardenCraftSelectionValue(normalizedStep.gardenCraftCategory, normalizedStep.gardenCraftKey),
-        '自定义打造',
+        parseEquipmentTypeMask(getEquipmentTypeValueForFilter(equipment))
+          || getCraftTargetEquipmentTypeMask(state.ui.equipmentTypeSelect?.value),
+        normalizedStep.gardenCraftKey,
       );
-      addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 花园工艺强化至上限完成。`);
+      addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 花园工艺完成。`);
+      return true;
+    }
+    if (normalizedStep.action === 'catalyst') {
+      await applyCatalystUntilMax(equipment, normalizedStep.gardenCraftKey, '自定义打造');
+      addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 催化剂强化至上限完成。`);
       return true;
     }
     const currencyTypeMap = {
@@ -18814,7 +19055,6 @@
     const currencyType = currencyTypeMap[normalizedStep.action];
     const success = await applyCraftCurrency(equipment, currencyType, actionConfig.currencyLabel);
     if (!success) throw new Error(`${actionConfig.currencyLabel}失败`);
-    await wait(getSpeedDelay());
     return true;
   };
 
@@ -20383,7 +20623,6 @@
         applySuccessfulSkillStoneUpgradeLocally(stone, payload);
         syncSkillStoneLocalStateToCache(stone);
         successCount += 1;
-        await wait(getSpeedDelay());
       } catch (error) {
         addLog(`${stone.name} 升级停止：${error.message}`, successCount ? 'warn' : 'info');
         break;
@@ -21404,7 +21643,6 @@
         state.equipmentFilterResults = state.equipmentFilterResults.filter((item) => item.id !== equipment.id);
         renderEquipmentFilterResults();
         addLog(`已丢弃筛选结果：${getEquipmentDisplayName(equipment)}`, 'compact');
-        await wait(getSpeedDelay());
       } catch (error) {
         failedItems.push({ equipment, error });
         addLog(`${getEquipmentDisplayName(equipment)} 丢弃失败：${error.message || error}`, 'error');
@@ -21434,7 +21672,6 @@
         successCount += 1;
         removeFracturedEquipmentIncrementally(equipment.id);
         addLog(`已丢弃破裂装备：${equipment.name}`, 'compact');
-        await wait(getSpeedDelay());
       } catch (error) {
         addLog(`${equipment.name} 丢弃失败：${error.message}`, 'error');
       }
@@ -22649,15 +22886,20 @@
   const getUniqueCraftDisplayEquipmentTypeMask = (equipmentType) => {
     const text = String(equipmentType || '').trim();
     if (!text) return 0n;
-    if (['单手斧', '单手剑', '单手锤', '短杖', '法杖', '匕首', '符文匕首', '爪'].some((name) => text.includes(name))) return EQUIPMENT_TYPE_MASKS.oneHandWeapons;
-    if (['双手斧', '双手剑', '双手锤', '长杖'].some((name) => text.includes(name))) return EQUIPMENT_TYPE_MASKS.twoHandWeapons;
-    if (text.includes('弓') && !text.includes('箭袋')) return EQUIPMENT_TYPE_MASKS.bows;
-    if (text.includes('箭袋')) return EQUIPMENT_TYPE_MASKS.quivers;
-    if (text.includes('头盔') || text.includes('头部')) return EQUIPMENT_TYPE_MASKS.helmets;
-    if (text.includes('胸甲')) return EQUIPMENT_TYPE_MASKS.bodyArmours;
-    if (text.includes('手套')) return EQUIPMENT_TYPE_MASKS.gloves;
-    if (text.includes('鞋子') || text.includes('靴子')) return EQUIPMENT_TYPE_MASKS.boots;
-    if (text.includes('盾牌')) return EQUIPMENT_TYPE_MASKS.shields;
+    const exactTypeMasks = [
+      ['符文匕首', 256n], ['匕首', 16n], ['爪', 8n], ['法杖', 4n], ['短杖', 128n],
+      ['细剑', 32n], ['单手剑', 1n], ['单手斧', 2n], ['单手锤', 64n],
+      ['战杖', 16384n], ['长杖', 1024n], ['双手剑', 2048n], ['双手斧', 4096n], ['双手锤', 8192n],
+      ['弓', EQUIPMENT_TYPE_MASKS.bows], ['箭袋', EQUIPMENT_TYPE_MASKS.quivers],
+    ];
+    const exactMatch = exactTypeMasks.find(([name]) => text.includes(name));
+    if (exactMatch) return exactMatch[1];
+    const getRepresentativeMask = (mask) => mask & -mask;
+    if (text.includes('头盔') || text.includes('头部')) return getRepresentativeMask(EQUIPMENT_TYPE_MASKS.helmets);
+    if (text.includes('胸甲')) return getRepresentativeMask(EQUIPMENT_TYPE_MASKS.bodyArmours);
+    if (text.includes('手套')) return getRepresentativeMask(EQUIPMENT_TYPE_MASKS.gloves);
+    if (text.includes('鞋子') || text.includes('靴子')) return getRepresentativeMask(EQUIPMENT_TYPE_MASKS.boots);
+    if (text.includes('盾牌')) return getRepresentativeMask(EQUIPMENT_TYPE_MASKS.shields);
     if (text.includes('腰带')) return EQUIPMENT_TYPE_MASKS.belts;
     if (text.includes('项链')) return EQUIPMENT_TYPE_MASKS.amulets;
     if (text.includes('戒指')) return EQUIPMENT_TYPE_MASKS.rings;
@@ -22721,6 +22963,19 @@
 
   const sanitizeUniqueCraftTargetConfig = (rawConfig = {}) => {
     const socketColor = rawConfig.socketColor || {};
+    const rawGardenCraftSelection = String(rawConfig.gardenCraftSelection || '');
+    const legacyCatalystMatch = rawGardenCraftSelection.match(/(?:^|\|)catalyst:(\d+)$/);
+    const legacyEnchantmentSelection = Boolean(rawConfig.legacyGardenCraftCleared)
+      || /(?:^|\|)enchantment:\d+$/.test(rawGardenCraftSelection);
+    const normalizedGardenCraftSelection = rawGardenCraftSelection.includes('|')
+      ? rawGardenCraftSelection.split('|').pop()
+      : rawGardenCraftSelection;
+    const rawCatalystSelection = String(rawConfig.catalystSelection || legacyCatalystMatch?.[1] || '');
+    const normalizedCatalystSelection = rawCatalystSelection
+      .split('|').pop()
+      .replace(/^catalyst:/, '');
+    const enableCatalyst = Boolean(rawConfig.enableCatalyst)
+      || (Boolean(rawConfig.enableGardenCraft) && Boolean(legacyCatalystMatch));
     const defaultResultRules = getDefaultUniqueCraftResultRules();
     const storeRule = isValidUniqueCraftRuleValue(UNIQUE_CRAFT_STORE_RULE_OPTIONS, rawConfig.storeRule)
       ? rawConfig.storeRule
@@ -22753,9 +23008,12 @@
       },
       socketFullSockets: rawConfig.socketFullSockets !== false && rawConfig.socketFullSockets !== 'false',
       socketFullLinks: rawConfig.socketFullLinks !== false && rawConfig.socketFullLinks !== 'false',
-      enableQuality: Boolean(rawConfig.enableQuality),
-      enableGardenCraft: Boolean(rawConfig.enableGardenCraft),
-      gardenCraftSelection: String(rawConfig.gardenCraftSelection || ''),
+      enableQuality: Boolean(rawConfig.enableQuality) && !enableCatalyst,
+      enableGardenCraft: Boolean(rawConfig.enableGardenCraft) && !legacyCatalystMatch,
+      gardenCraftSelection: legacyCatalystMatch || legacyEnchantmentSelection ? '' : normalizedGardenCraftSelection,
+      legacyGardenCraftCleared: legacyEnchantmentSelection,
+      enableCatalyst,
+      catalystSelection: normalizedCatalystSelection,
       enableRoll: Boolean(rawConfig.enableRoll),
       rollConditions,
       rollMismatchAction: UNIQUE_CRAFT_ROLL_MISMATCH_ACTION_OPTIONS.some((option) => option.value === rawConfig.rollMismatchAction)
@@ -22811,6 +23069,8 @@
       enableQuality: false,
       enableGardenCraft: false,
       gardenCraftSelection: '',
+      enableCatalyst: false,
+      catalystSelection: '',
       enableVaal: false,
     };
   };
@@ -22828,6 +23088,9 @@
       targetCount: Math.max(1, Number.parseInt(rawPlan.targetCount, 10) || 1),
       useStorage: rawPlan.useStorage === true || rawPlan.useStorage === 'true',
       steps: steps.length ? steps : [getDefaultUniqueCraftStep()],
+      gardenCraftCompatibilitySteps: [...new Set((steps.length ? steps : []).flatMap((step, stepIndex) => (
+        Object.values(step.targets || {}).some((targetConfig) => targetConfig?.legacyGardenCraftCleared) ? [stepIndex] : []
+      )))],
     };
   };
 
@@ -23417,6 +23680,10 @@
       gardenCraftSelection: !isVaalStartMode && (
         controls.gardenSelect?.value || controls.gardenSelect?.dataset.pendingGardenCraftSelection || ''
       ),
+      enableCatalyst: !isVaalStartMode && controls.catalystInput?.checked,
+      catalystSelection: !isVaalStartMode && (
+        controls.catalystSelect?.value || controls.catalystSelect?.dataset.pendingCatalystSelection || ''
+      ),
       enableRoll: controls.rollInput?.checked,
       rollConditions,
       rollMismatchAction: controls.rollMismatchActionSelect?.value,
@@ -23563,9 +23830,15 @@
   };
 
   const loadUniqueCraftPlan = () => {
-    applyUniqueCraftPlanToUi(readSavedUniqueCraftPlan());
-    scheduleUniqueCraftGardenCraftOptionsRefresh(getUniqueCraftPreferredGardenCraftSelection());
-    addLog('已读取暗金打造配置。', 'compact');
+    const plan = readSavedUniqueCraftPlan();
+    applyUniqueCraftPlanToUi(plan);
+    if (plan.gardenCraftCompatibilitySteps.length) {
+      const stepNumbers = plan.gardenCraftCompatibilitySteps.map((stepIndex) => stepIndex + 1);
+      addLog(`已部分兼容并读取暗金打造配置：第 ${stepNumbers.join('、')} 步的旧花园附魔已清空，请重新选择。`, 'warn');
+      switchMainTab('logs');
+    } else {
+      addLog('已读取暗金打造配置。', 'compact');
+    }
   };
 
   const clearUniqueCraftPlanUi = () => {
@@ -23610,39 +23883,37 @@
       }))),
   ];
 
-  const getUniqueCraftPreferredGardenCraftSelection = () => {
-    const currentSelect = state.ui.uniqueCraftTargetList?.querySelector('[data-role="gardenCraftSelection"]');
-    const uiSelection = currentSelect?.value || currentSelect?.dataset.pendingGardenCraftSelection || '';
-    if (uiSelection) return uiSelection;
-    const currentStep = state.uniqueCraftSteps[state.activeUniqueCraftStepIndex] || {};
-    return Object.values(currentStep.targets || {}).map((targetConfig) => targetConfig?.gardenCraftSelection).find(Boolean) || '';
-  };
-
-  const scheduleUniqueCraftGardenCraftOptionsRefresh = (preferredSelection = '') => {
-    refreshAdvancedBatchGardenCraftOptions(false, preferredSelection).then(() => {
+  const scheduleUniqueCraftGardenCraftOptionsRefresh = () => {
+    if (state.gardenCraft.startupInitialized) return;
+    ensureGardenAndCatalystStartupData().then(() => {
       saveCurrentUniqueCraftStepSilently();
       renderUniqueCraftTargets();
     }).catch((error) => {
-      addLog(`暗金打造花园工艺列表读取失败：${error.message}`, 'error');
+      addLog(`暗金打造花园工艺或催化剂列表读取失败：${error.message}`, 'error');
     });
   };
 
-  const appendUniqueCraftPendingGardenCraftOption = (selectElement, pendingSelection) => {
-    const value = String(pendingSelection || '').trim();
-    if (!value) return;
-    const exists = Array.from(selectElement.options || []).some((option) => option.value === value);
-    if (exists) return;
-    selectElement.append(createElement('option', {
-      value,
-      textContent: '已保存花园工艺（等待加载）',
-    }));
+  const createUniqueCraftGardenCraftSelect = (item, pendingSelection = '') => {
+    const selectElement = createSelect([], '');
+    const equipmentTypeMask = getUniqueCraftItemEquipmentTypeMask(item);
+    const cacheLoaded = !isGardenOrCatalystEquipmentType(equipmentTypeMask) || state.gardenCraft.startupInitialized;
+    const options = getGardenCraftsByEquipmentType(equipmentTypeMask, true)
+      .map((craft) => ({ value: craft.key, label: craft.label }));
+    setSelectOptions(selectElement, options, options.length ? '选择花园附魔' : (cacheLoaded ? '无可用花园附魔' : '花园附魔加载中'));
+    const selectedValue = String(pendingSelection || '');
+    selectElement.value = options.some((option) => String(option.value) === selectedValue) ? selectedValue : '';
+    return selectElement;
   };
 
-  const createUniqueCraftGardenCraftSelect = (pendingSelection = '') => {
+  const createUniqueCraftCatalystSelect = (item, pendingSelection = '') => {
     const selectElement = createSelect([], '');
-    const options = getAdvancedGardenCraftOptions();
-    setSelectOptions(selectElement, options, options.length ? '选择花园工艺' : '花园工艺加载中');
-    appendUniqueCraftPendingGardenCraftOption(selectElement, pendingSelection);
+    const equipmentTypeMask = getUniqueCraftItemEquipmentTypeMask(item);
+    const cacheLoaded = !isGardenOrCatalystEquipmentType(equipmentTypeMask) || state.gardenCraft.startupInitialized;
+    const options = getCatalystsByEquipmentType(equipmentTypeMask)
+      .map((catalyst) => ({ value: catalyst.key, label: catalyst.label }));
+    setSelectOptions(selectElement, options, options.length ? '选择催化剂' : (cacheLoaded ? '该装备不可使用催化剂' : '催化剂加载中'));
+    const selectedValue = String(pendingSelection || '');
+    selectElement.value = options.some((option) => String(option.value) === selectedValue) ? selectedValue : '';
     return selectElement;
   };
 
@@ -23669,6 +23940,7 @@
     socketFullLinksSelect.dataset.role = 'socketFullLinks';
     const qualityInput = createElement('input', { type: 'checkbox', checked: targetConfig.enableQuality, dataset: { role: 'enableQuality' } });
     const gardenInput = createElement('input', { type: 'checkbox', checked: targetConfig.enableGardenCraft, dataset: { role: 'enableGardenCraft' } });
+    const catalystInput = createElement('input', { type: 'checkbox', checked: targetConfig.enableCatalyst, dataset: { role: 'enableCatalyst' } });
     const vaalInput = createElement('input', { type: 'checkbox', checked: targetConfig.enableVaal, dataset: { role: 'enableVaal' } });
     const rollInput = createElement('input', { type: 'checkbox', checked: targetConfig.enableRoll, dataset: { role: 'enableRoll' } });
     const rollEffectOptions = getUniqueCraftRollEffectOptions(item);
@@ -23825,12 +24097,25 @@
           textContent: item.rollReady ? '1. 暂无roll数据 无法处理roll值' : '1. 暂无roll数据 无法处理roll值',
         }),
       ];
-    const gardenSelect = createUniqueCraftGardenCraftSelect(targetConfig.gardenCraftSelection);
+    const gardenSelect = createUniqueCraftGardenCraftSelect(item, targetConfig.gardenCraftSelection);
     gardenSelect.dataset.role = 'gardenCraftSelection';
-    gardenSelect.dataset.pendingGardenCraftSelection = targetConfig.gardenCraftSelection;
-    setInputValue(gardenSelect, targetConfig.gardenCraftSelection);
-    [socketInput, socketFullSocketsSelect, socketFullLinksSelect, qualityInput, gardenInput, vaalInput].forEach((inputElement) => setUniqueCraftUnavailableControl(inputElement, isVaalStartMode));
-    gardenSelect.disabled = isVaalStartMode;
+    gardenSelect.dataset.pendingGardenCraftSelection = state.gardenCraft.startupInitialized ? '' : targetConfig.gardenCraftSelection;
+    const catalystSelect = createUniqueCraftCatalystSelect(item, targetConfig.catalystSelection);
+    catalystSelect.dataset.role = 'catalystSelection';
+    catalystSelect.dataset.pendingCatalystSelection = state.gardenCraft.startupInitialized ? '' : targetConfig.catalystSelection;
+    const targetEquipmentTypeMask = getUniqueCraftItemEquipmentTypeMask(item);
+    const supportsGardenOrCatalyst = isGardenOrCatalystEquipmentType(targetEquipmentTypeMask);
+    const gardenOptionsLoaded = !supportsGardenOrCatalyst || state.gardenCraft.startupInitialized;
+    const catalystOptionsLoaded = !supportsGardenOrCatalyst || state.gardenCraft.startupInitialized;
+    const hasGardenEnchantments = getGardenCraftsByEquipmentType(targetEquipmentTypeMask, true).length > 0;
+    const hasCatalysts = getCatalystsByEquipmentType(targetEquipmentTypeMask).length > 0;
+    const hideQualityForCatalyst = catalystOptionsLoaded && hasCatalysts;
+    [socketInput, socketFullSocketsSelect, socketFullLinksSelect, vaalInput].forEach((inputElement) => setUniqueCraftUnavailableControl(inputElement, isVaalStartMode));
+    setUniqueCraftUnavailableControl(qualityInput, isVaalStartMode || hideQualityForCatalyst);
+    setUniqueCraftUnavailableControl(gardenInput, isVaalStartMode || (gardenOptionsLoaded && !hasGardenEnchantments));
+    setUniqueCraftUnavailableControl(catalystInput, isVaalStartMode || (catalystOptionsLoaded && !hasCatalysts));
+    gardenSelect.disabled = isVaalStartMode || (gardenOptionsLoaded && !hasGardenEnchantments);
+    catalystSelect.disabled = isVaalStartMode || (catalystOptionsLoaded && !hasCatalysts);
     const storeRuleSelect = createSelect(UNIQUE_CRAFT_STORE_RULE_OPTIONS, targetConfig.storeRule);
     storeRuleSelect.dataset.role = 'storeRule';
     const keepRuleSelect = createSelect(UNIQUE_CRAFT_KEEP_RULE_OPTIONS, targetConfig.keepRule);
@@ -23859,6 +24144,39 @@
       value: targetConfig.socketColor.blue,
       dataset: { role: 'socketBlue' },
     });
+    let nextUniqueCraftActionNumber = 3;
+    const uniqueCraftActionRows = [];
+    if (!hideQualityForCatalyst) {
+      uniqueCraftActionRows.push(createUniqueCraftOptionRow(
+        `${nextUniqueCraftActionNumber}. 品质补满（自动选择品质通货）`,
+        qualityInput,
+      ));
+      nextUniqueCraftActionNumber += 1;
+    }
+    if (!gardenOptionsLoaded || hasGardenEnchantments) {
+      uniqueCraftActionRows.push(createUniqueCraftOptionRow(
+        `${nextUniqueCraftActionNumber}. 花园附魔`,
+        gardenInput,
+        gardenSelect,
+      ));
+      nextUniqueCraftActionNumber += 1;
+    }
+    if (!catalystOptionsLoaded || hasCatalysts) {
+      uniqueCraftActionRows.push(createUniqueCraftOptionRow(
+        `${nextUniqueCraftActionNumber}. 催化剂`,
+        catalystInput,
+        catalystSelect,
+      ));
+      nextUniqueCraftActionNumber += 1;
+    }
+    uniqueCraftActionRows.push(createUniqueCraftOptionRow(
+      `${nextUniqueCraftActionNumber}. 使用瓦尔宝珠`,
+      vaalInput,
+    ));
+    nextUniqueCraftActionNumber += 1;
+    const storeRuleActionNumber = nextUniqueCraftActionNumber;
+    const keepRuleActionNumber = nextUniqueCraftActionNumber + 1;
+    const destroyRuleActionNumber = nextUniqueCraftActionNumber + 2;
     const cardElement = createElement('details', {
       className: 'poe2-unique-craft-card',
       dataset: { uniqueCraftKey: getUniqueCraftItemKey(item) },
@@ -23893,27 +24211,25 @@
                 createLabeledControl('蓝孔', socketBlueInput),
               ],
             }), 'is-socket'),
-            createUniqueCraftOptionRow('3. 品质补满（自动选择品质通货）', qualityInput),
-            createUniqueCraftOptionRow('4. 花园工艺', gardenInput, gardenSelect),
-            createUniqueCraftOptionRow('5. 使用瓦尔宝珠', vaalInput),
+            ...uniqueCraftActionRows,
             createElement('div', {
               className: 'poe2-unique-craft-option-row poe2-wide',
               children: [
-                createElement('div', { className: 'poe2-section-title poe2-unique-craft-position-title', textContent: '6. 储存哪些' }),
+                createElement('div', { className: 'poe2-section-title poe2-unique-craft-position-title', textContent: `${storeRuleActionNumber}. 储存哪些` }),
                 storeRuleSelect,
               ],
             }),
             createElement('div', {
               className: 'poe2-unique-craft-option-row poe2-wide',
               children: [
-                createElement('div', { className: 'poe2-section-title poe2-unique-craft-position-title', textContent: '7. 保留哪些' }),
+                createElement('div', { className: 'poe2-section-title poe2-unique-craft-position-title', textContent: `${keepRuleActionNumber}. 保留哪些` }),
                 keepRuleSelect,
               ],
             }),
             createElement('div', {
               className: 'poe2-unique-craft-option-row poe2-wide',
               children: [
-                createElement('div', { className: 'poe2-section-title poe2-unique-craft-position-title', textContent: '8. 丢弃哪些' }),
+                createElement('div', { className: 'poe2-section-title poe2-unique-craft-position-title', textContent: `${destroyRuleActionNumber}. 丢弃哪些` }),
                 destroyRuleSelect,
               ],
             }),
@@ -23938,6 +24254,8 @@
       qualityInput,
       gardenInput,
       gardenSelect,
+      catalystInput,
+      catalystSelect,
       rollInput,
       rollConditionList: rollConditionListElement,
       rollMismatchActionSelect,
@@ -23985,6 +24303,9 @@
     });
     state.ui.uniqueCraftRenderedCards = cardElements;
     listElement.replaceChildren(...cardElements);
+    if (!state.gardenCraft.startupInitialized && items.some((item) => (
+      isGardenOrCatalystEquipmentType(getUniqueCraftItemEquipmentTypeMask(item))
+    ))) scheduleUniqueCraftGardenCraftOptionsRefresh();
   };
 
   /**
@@ -24681,6 +25002,7 @@
   const getContinuousActionKind = (action) => {
     if (action === 'craftBench') return 'craftBench';
     if (action === 'gardenCraft') return 'gardenCraft';
+    if (action === 'catalyst') return 'catalyst';
     if (['ensureMagic', 'ensureRare', 'smartAugment', 'smartExalted', 'smartCraftBench'].includes(action)) return 'aggregate';
     if (action === 'conditionCheck') return 'condition';
     if (action === 'none') return 'none';
@@ -24698,6 +25020,7 @@
     const kind = state.ui.continuousActionKindSelect?.value || getContinuousActionKind(fallbackAction);
     if (kind === 'craftBench') return 'craftBench';
     if (kind === 'gardenCraft') return 'gardenCraft';
+    if (kind === 'catalyst') return 'catalyst';
     if (kind === 'condition') return 'conditionCheck';
     if (kind === 'none') return 'none';
     const selectedAction = state.ui.continuousActionSelect?.value;
@@ -24744,6 +25067,7 @@
     const currentAction = getActionFromContinuousActionControls();
     const isCraftBenchAction = ['craftBench', 'smartCraftBench'].includes(currentAction);
     const isGardenCraftAction = currentAction === 'gardenCraft';
+    const isCatalystAction = currentAction === 'catalyst';
     if (state.ui.continuousCraftCategoryField) {
       state.ui.continuousCraftCategoryField.hidden = !isCraftBenchAction;
     }
@@ -24754,7 +25078,9 @@
       state.ui.continuousGardenCategoryField.hidden = !isGardenCraftAction;
     }
     if (state.ui.continuousGardenCraftField) {
-      state.ui.continuousGardenCraftField.hidden = !isGardenCraftAction;
+      state.ui.continuousGardenCraftField.hidden = !isGardenCraftAction && !isCatalystAction;
+      const labelElement = state.ui.continuousGardenCraftField.querySelector('span');
+      if (labelElement) labelElement.textContent = isCatalystAction ? '催化剂' : '工艺方法';
     }
   };
 
@@ -24779,21 +25105,25 @@
 
   const refreshContinuousGardenCraftOptions = async (forceRefresh = false, preferredGardenCraftKey = '') => {
     if (!state.ui.continuousGardenCategorySelect || !state.ui.continuousGardenCraftSelect) return;
-    const categoryValue = state.ui.continuousGardenCategorySelect.value;
-    await ensureGardenCraftList(categoryValue, forceRefresh);
+    const isCatalystAction = getActionFromContinuousActionControls() === 'catalyst';
+    const categoryValue = isCatalystAction ? 'jewelry' : state.ui.continuousGardenCategorySelect.value;
+    if (isCatalystAction) await ensureCatalystList(categoryValue);
+    else await ensureGardenCraftList(categoryValue);
     const selectedGardenCraftKey = preferredGardenCraftKey || state.ui.continuousGardenCraftSelect.value;
-    const options = getGardenCraftOptionsByCategory(categoryValue);
-    setSelectOptions(state.ui.continuousGardenCraftSelect, options, '选择花园工艺方法');
+    const options = isCatalystAction
+      ? getCatalystOptionsByCategory(categoryValue)
+      : getGardenCraftOptionsByCategory(categoryValue);
+    setSelectOptions(state.ui.continuousGardenCraftSelect, options, isCatalystAction ? '选择催化剂' : '选择花园工艺方法');
     if (options.some((option) => String(option.value) === String(selectedGardenCraftKey))) {
       state.ui.continuousGardenCraftSelect.value = selectedGardenCraftKey;
     }
     state.ui.continuousGardenCraftSelect.dataset.pendingGardenCraftKey = '';
-    if (forceRefresh) addLog(`花园工艺列表已刷新：${options.length} 条。`, 'compact');
+    if (forceRefresh) addLog(`${isCatalystAction ? '催化剂' : '花园工艺'}列表已刷新：${options.length} 条。`, 'compact');
   };
 
   const scheduleContinuousGardenCraftOptionsRefresh = (forceRefresh = false, preferredGardenCraftKey = '') => {
     refreshContinuousGardenCraftOptions(forceRefresh, preferredGardenCraftKey).catch((error) => {
-      addLog(`花园工艺列表读取失败：${error.message}`, 'error');
+      addLog(`花园工艺或催化剂列表读取失败：${error.message}`, 'error');
     });
   };
 
@@ -24810,13 +25140,14 @@
       const actionConfig = CONTINUOUS_CRAFT_ACTIONS[step.action];
       const effectiveGroups = step.conditionGroups.filter((group) => group.conditions.length > 0);
       const usesCraftBenchSelection = ['craftBench', 'smartCraftBench'].includes(step.action);
-      const usesGardenCraftSelection = step.action === 'gardenCraft';
+      const usesGardenCraftSelection = ['gardenCraft', 'catalyst'].includes(step.action);
       const craft = usesCraftBenchSelection ? getCraftBenchById(step.craftId) : null;
-      const gardenCraft = usesGardenCraftSelection ? getGardenCraftByKey(step.gardenCraftCategory, step.gardenCraftKey) : null;
+      const gardenCraft = step.action === 'gardenCraft' ? findLoadedGardenCraftByKey(step.gardenCraftKey) : null;
+      const catalyst = step.action === 'catalyst' ? findLoadedCatalystByKey(step.gardenCraftKey) : null;
       const craftText = usesCraftBenchSelection
         ? `：${craft?.label || (step.craftId ? `工艺 ID ${step.craftId}` : '未选择工艺')}`
         : usesGardenCraftSelection
-          ? `：${gardenCraft?.label || (step.gardenCraftKey ? `花园工艺 ${step.gardenCraftKey}` : '未选择花园工艺')}`
+          ? `：${(gardenCraft || catalyst)?.label || (step.gardenCraftKey ? `${step.action === 'catalyst' ? '催化剂' : '花园工艺'} ${step.gardenCraftKey}` : `未选择${step.action === 'catalyst' ? '催化剂' : '花园工艺'}`)}`
         : '';
       const stepCode = formatContinuousStepCode(stepIndex);
       const groupText = step.action === 'conditionCheck' ? `（${effectiveGroups.length} 组）` : '';
@@ -24871,9 +25202,10 @@
       const failureConfig = CONTINUOUS_STEP_HANDLINGS[step.failureHandling];
       const effectiveGroups = step.conditionGroups.filter((group) => group.conditions.length > 0);
       const usesCraftBenchSelection = ['craftBench', 'smartCraftBench'].includes(step.action);
-      const usesGardenCraftSelection = step.action === 'gardenCraft';
+      const usesGardenCraftSelection = ['gardenCraft', 'catalyst'].includes(step.action);
       const craft = usesCraftBenchSelection ? getCraftBenchById(step.craftId) : null;
-      const gardenCraft = usesGardenCraftSelection ? getGardenCraftByKey(step.gardenCraftCategory, step.gardenCraftKey) : null;
+      const gardenCraft = step.action === 'gardenCraft' ? findLoadedGardenCraftByKey(step.gardenCraftKey) : null;
+      const catalyst = step.action === 'catalyst' ? findLoadedCatalystByKey(step.gardenCraftKey) : null;
       const stepCode = formatContinuousStepCode(stepIndex);
       const successText = step.successHandling === 'jump'
         ? `条件成立跳转步骤${formatContinuousStepEditableTargetLabel(step.successTargetStepIndex ?? stepIndex + 1, steps.length)}`
@@ -24888,12 +25220,12 @@
       const actionText = `${actionLabel}${
         craft
           ? `：${craft.label}`
-          : gardenCraft
-            ? `：${gardenCraft.label}`
+          : (gardenCraft || catalyst)
+            ? `：${(gardenCraft || catalyst).label}`
             : usesCraftBenchSelection
               ? '：未选择工艺'
               : usesGardenCraftSelection
-                ? '：未选择花园工艺'
+                ? `：未选择${step.action === 'catalyst' ? '催化剂' : '花园工艺'}`
                 : ''
       }`;
       const nextText = step.successHandling === 'jump'
@@ -26374,7 +26706,7 @@
           children: [
             createLabeledControl('UI 风格', state.ui.themeModeSelect),
             createLabeledControl(createHelpedLabel('自动化速度', '速度档位说明', [
-              '只控制步骤间等待时间。',
+              '所有自动化 API 请求严格串行，相邻请求统一按当前档位留出间隔。',
               '不影响日志多少。',
               '逐步：等待 2.5 秒。',
               '普通：等待 0.7 秒。',
@@ -27147,6 +27479,13 @@
       getAffixEquipmentOptions(),
       '不限装备类型',
     );
+    state.ui.equipmentTypeSelect.addEventListener('change', () => {
+      if (['gardenCraft', 'catalyst'].includes(getActionFromContinuousActionControls())) {
+        state.ui.continuousGardenCraftSelect.value = '';
+        state.ui.continuousGardenCraftSelect.dataset.pendingGardenCraftKey = '';
+        scheduleContinuousGardenCraftOptionsRefresh(false);
+      }
+    });
     state.ui.raritySelect = createSelect([
       { value: RARITY_TYPES.any, label: '不限' },
       { value: RARITY_TYPES.normal, label: '普通' },
@@ -27247,9 +27586,6 @@
     state.ui.uniqueCraftIncludeDroppedUniquesInput.addEventListener('change', syncUniqueCraftCurrentStepSummary);
     state.ui.uniqueCraftTargetList.addEventListener('change', (event) => {
       syncUniqueCraftCurrentStepSummary();
-      if (event.target?.dataset?.role === 'enableGardenCraft' && event.target.checked && !getAdvancedGardenCraftOptions().length) {
-        scheduleUniqueCraftGardenCraftOptionsRefresh(getUniqueCraftPreferredGardenCraftSelection());
-      }
     });
     state.ui.uniqueCraftTargetList.addEventListener('input', syncUniqueCraftCurrentStepSummary);
     state.ui.craftPlanNameInput = createElement('input', { className: 'poe2-input', placeholder: '自定义方案名称' });
@@ -27619,12 +27955,16 @@
       setSelectOptions(state.ui.continuousActionSelect, detailOptions);
       state.ui.continuousActionSelect.hidden = detailOptions.length === 0;
       if (detailOptions.length) state.ui.continuousActionSelect.value = detailOptions[0].value;
+      if (['gardenCraft', 'catalyst'].includes(getActionFromContinuousActionControls())) {
+        state.ui.continuousGardenCraftSelect.value = '';
+        state.ui.continuousGardenCraftSelect.dataset.pendingGardenCraftKey = '';
+      }
       saveCurrentContinuousStepSilently();
       updateContinuousHandlingTargetVisibility();
       updateContinuousCraftBenchControlsVisibility();
       if (['craftBench', 'smartCraftBench'].includes(getActionFromContinuousActionControls())) {
         scheduleContinuousCraftBenchOptionsRefresh(false);
-      } else if (getActionFromContinuousActionControls() === 'gardenCraft') {
+      } else if (['gardenCraft', 'catalyst'].includes(getActionFromContinuousActionControls())) {
         scheduleContinuousGardenCraftOptionsRefresh(false);
       }
       renderContinuousCraftSteps();
@@ -27635,7 +27975,7 @@
       updateContinuousCraftBenchControlsVisibility();
       if (['craftBench', 'smartCraftBench'].includes(getActionFromContinuousActionControls())) {
         scheduleContinuousCraftBenchOptionsRefresh(false);
-      } else if (getActionFromContinuousActionControls() === 'gardenCraft') {
+      } else if (['gardenCraft', 'catalyst'].includes(getActionFromContinuousActionControls())) {
         scheduleContinuousGardenCraftOptionsRefresh(false);
       }
       renderContinuousCraftSteps();
@@ -27807,6 +28147,8 @@
                   '每步先执行动作，再进入下一步。',
                   '使用通货：只用一次。',
                   '工艺：只执行一次。',
+                  '花园工艺：只显示当前可用工艺，每步应用一次。',
+                  '催化剂：独立于花园工艺，持续强化至品质上限。',
                   '智能操作：只在需要时消耗。',
                   '智能工艺：已有相同工艺会跳过。',
                   '有多大师且对应位置有空位时，会尝试工艺。',
@@ -27947,7 +28289,8 @@
             createHelpTooltip('暗金打造说明', [
               '按步骤依次打造目标基底。',
               '命中暗金后，按对应暗金卡片里的配置处理。',
-              '可配置孔洞、品质、花园、Roll、瓦尔和最终去向。',
+              '可配置孔洞、品质、花园附魔、催化剂、Roll、瓦尔和最终去向。',
+              '花园附魔与催化剂按每件暗金的实际装备类型分别显示。',
               '暗金不能重铸；非暗金结果按“非暗金处理”处理。',
               'Roll 填装备上看到的实际数值，不填百分比。',
               '多个 Roll 条件默认全部满足。',
@@ -28205,6 +28548,7 @@
 
   const initializeGardenCraftData = async () => {
     try {
+      const preloadResult = await ensureGardenAndCatalystStartupData();
       const preferredSelection = state.ui.advancedBatchGardenCraftSelect?.dataset.pendingGardenCraftSelection || '';
       await refreshAdvancedBatchGardenCraftOptions(false, preferredSelection);
       const equipmentFilterPreferredSelection = state.ui.equipmentFilterBatchGardenCraftSelect?.dataset.pendingGardenCraftSelection || '';
@@ -28213,9 +28557,12 @@
         saveCurrentUniqueCraftStepSilently();
         renderUniqueCraftTargets();
       }
-      addLog(`花园工艺已自动加载：${getAdvancedGardenCraftOptions().length} 条。`, 'compact');
+      addLog(
+        `花园工艺与催化剂已在启动阶段缓存：花园 ${preloadResult?.gardenRequestCount || 0} 个装备类型，催化剂 ${preloadResult?.catalystRequestCount || 0} 个装备类型；后续不再请求列表。`,
+        (preloadResult?.gardenFailureCount || preloadResult?.catalystFailureCount) ? 'warn' : 'compact',
+      );
     } catch (error) {
-      addLog(`花园工艺自动加载失败：${error.message}`, 'warn');
+      addLog(`花园工艺与催化剂启动缓存失败：${error.message}`, 'warn');
     }
   };
 
