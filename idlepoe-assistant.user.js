@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         idlepoe 助手测试服版 2.23
+// @name         idlepoe 助手测试服版 2.24
 // @namespace    https://idlepoe.com
-// @version      2.23.9.2
+// @version      2.24.1
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @match        *://poe-test.faith.wang/*
 // @grant        GM_addStyle
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.23.9.2';
+  const ASSISTANT_PATCH_VERSION = '2.24.1';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -161,6 +161,8 @@
     equipmentFilterBatchPlan: createStorageKey('equipmentFilterBatchPlan'),
     uniqueCraftPlan: createStorageKey('uniqueCraftPlan'),
     settings: createStorageKey('settings'),
+    /** automationSpeedV4 是 2.24 独立速度存储；新键首次不存在时统一重置为快速。 */
+    automationSpeed: createStorageKey('automationSpeedV4'),
   };
 
   const TRANSIENT_ASSISTANT_STORAGE_KEYS = [
@@ -173,6 +175,8 @@
     'recentMailReceivers',
     'minimizePausesAutomation',
     'speedMode',
+    'automationSpeedV2',
+    'automationSpeedV3',
     'logMode',
     'themeMode',
     'stepActionSafetyLimit',
@@ -272,31 +276,31 @@
   const SKILL_STONE_MAX_UPGRADE_ATTEMPTS = 24;
 
   /**
-   * GEMCUTTER_PRISM_BATCH_SIZE 控制单颗技能石使用棱镜时的并发请求数。
-   * 小批次比逐次等待更快，也比一次性大量请求更容易观察进度和定位失败。
+   * GEMCUTTER_PRISM_BATCH_SIZE 固定为 1，确保同一颗技能石不会同时收到多个修改请求。
+   * 服务端会对短时间内的同资源并发写入限流，并发使用棱镜既容易触发 429，也可能让返回状态乱序。
    */
-  const GEMCUTTER_PRISM_BATCH_SIZE = 5;
+  const GEMCUTTER_PRISM_BATCH_SIZE = 1;
 
   /**
    * SKILL_STONE_UPGRADE_CONCURRENCY 控制选中技能石升级时同时处理几颗。
    * 单颗内部仍然逐级请求，避免同一颗石头的等级状态被并发请求打乱。
    */
-  const SKILL_STONE_UPGRADE_CONCURRENCY = 5;
+  const SKILL_STONE_UPGRADE_CONCURRENCY = 1;
 
   /**
-   * SKILL_STONE_VAAL_BATCH_SIZE 控制批量腐化技能石时的并发数量。
+   * SKILL_STONE_VAAL_BATCH_SIZE 固定为 1，批量腐化严格串行。
    */
-  const SKILL_STONE_VAAL_BATCH_SIZE = 5;
+  const SKILL_STONE_VAAL_BATCH_SIZE = 1;
 
   /**
-   * SKILL_STONE_PRACTICE_CONCURRENCY 控制智能练技能调整位置时的并发请求数。
+   * SKILL_STONE_PRACTICE_CONCURRENCY 固定为 1，智能练技能严格串行。
    */
-  const SKILL_STONE_PRACTICE_CONCURRENCY = 5;
+  const SKILL_STONE_PRACTICE_CONCURRENCY = 1;
 
-  /**
-   * SKILL_STONE_DETAIL_CONCURRENCY 控制加载技能石时并发读取详情的请求数。
-   */
-  const SKILL_STONE_DETAIL_CONCURRENCY = 5;
+  /** SKILL_STONE_DETAIL_CONCURRENCY 仅用于按动作补齐缺失详情，不再在加载列表时逐颗读取。 */
+  const SKILL_STONE_DETAIL_CONCURRENCY = 1;
+  /** 技能石写操作即使选择“立即”也保留极短间隔，避免连续修改同一资源触发限流。 */
+  const SKILL_STONE_WRITE_MIN_DELAY_MS = 200;
 
   const EXCEPTIONAL_SKILL_STONE_NAMES = new Set(['赋予(辅)', '启蒙(辅)', '增幅(辅)']);
   const EXCEPTIONAL_SKILL_STONE_IDS = new Set([
@@ -329,17 +333,17 @@
   /**
    * BATCH_CURRENCY_CONCURRENCY 控制批量通货同时处理几件装备。
    */
-  const BATCH_CURRENCY_CONCURRENCY = 5;
+  const BATCH_CURRENCY_CONCURRENCY = 1;
 
   /**
    * CRAFT_SOCKET_CONCURRENCY 控制孔洞操作同时处理几件装备。
    */
-  const CRAFT_SOCKET_CONCURRENCY = 5;
+  const CRAFT_SOCKET_CONCURRENCY = 1;
 
   /**
    * AUTO_UNIQUE_CONCURRENCY 控制自动暗金同时处理几件装备。
    */
-  const AUTO_UNIQUE_CONCURRENCY = 5;
+  const AUTO_UNIQUE_CONCURRENCY = 1;
 
   /**
    * GEMCUTTER_TARGET_QUALITY 表示宝石匠的棱镜自动使用的目标品质。
@@ -352,10 +356,9 @@
   const EQUIPMENT_TARGET_QUALITY = 20;
 
   /**
-   * FRACTURED_DESTROY_BATCH_SIZE 控制批量丢弃破裂装备时的并发数量。
-   * 小批次可以明显快于逐件等待，同时比一次性全部请求更稳。
+   * FRACTURED_DESTROY_BATCH_SIZE 固定为 1，批量丢弃破裂装备严格串行。
    */
-  const FRACTURED_DESTROY_BATCH_SIZE = 5;
+  const FRACTURED_DESTROY_BATCH_SIZE = 1;
 
   /**
    * TAIL_PAGE_DESTROY_CONFIG 定义其他功能里的背包尾页清理范围。
@@ -385,16 +388,16 @@
   const RANK_ANALYSIS_CONFIG = {
     maxPages: 200,
     topLimit: 50,
-    concurrency: 5,
+    concurrency: 1,
   };
 
   /**
-   * EQUIPMENT_FILTER_CONFIG 控制只读装备筛选页的分页和详情并发。
+   * EQUIPMENT_FILTER_CONFIG 控制只读装备筛选页的分页；详情读取固定串行。
    * 筛选只读取背包/储藏，不执行改造、丢弃或存储操作。
    */
   const EQUIPMENT_FILTER_CONFIG = {
     pageSize: 100,
-    detailConcurrency: 5,
+    detailConcurrency: 1,
   };
 
   /**
@@ -495,6 +498,8 @@
     affixRollMinimum: { label: '前后缀最低Roll', valueType: 'percent' },
     craftedRollAverage: { label: '工艺词缀平均Roll', valueType: 'percent' },
     craftedRollMinimum: { label: '工艺词缀最低Roll', valueType: 'percent' },
+    groupAffixRollMinimum: { label: '条件组内词缀最低Roll', valueType: 'percent' },
+    groupAffixRollAverage: { label: '条件组内词缀平均Roll', valueType: 'percent' },
     uniqueAffixRollAverage: { label: '暗金词条平均Roll', valueType: 'percent' },
   };
 
@@ -1930,13 +1935,13 @@
    * SPEED_OPTIONS 定义全局自动化速度档位，只控制等待间隔，不控制日志密度。
    */
   const SPEED_OPTIONS = {
-    stepwise: { label: '逐步', delayMs: 1500 },
-    normal: { label: '普通', delayMs: 500 },
-    fast: { label: '快速', delayMs: 50 },
+    stepwise: { label: '逐步', delayMs: 2500 },
+    normal: { label: '普通', delayMs: 700 },
+    fast: { label: '快速', delayMs: 300 },
     immediate: { label: '立即', delayMs: 0 },
   };
 
-  const normalizeSpeedMode = (speedMode) => (SPEED_OPTIONS[speedMode] ? speedMode : 'normal');
+  const normalizeSpeedMode = (speedMode) => (SPEED_OPTIONS[speedMode] ? speedMode : 'fast');
 
   const LOG_MODES = {
     trace: { label: '逐条', minPriority: 10 },
@@ -2149,6 +2154,49 @@
     jewels: 1125899906842624n,
   };
 
+  const CRAFT_EQUIPMENT_TYPE_LABEL_MASKS = {
+    单手武器: EQUIPMENT_TYPE_MASKS.oneHandWeapons,
+    单手剑: 1n,
+    单手斧: 2n,
+    法杖: 4n,
+    爪: 8n,
+    匕首: 16n,
+    细剑: 32n,
+    单手锤: 64n,
+    短杖: 128n,
+    符文匕首: 256n,
+    双手武器: EQUIPMENT_TYPE_MASKS.twoHandWeapons,
+    长杖: 1024n,
+    双手剑: 2048n,
+    双手斧: 4096n,
+    双手锤: 8192n,
+    战杖: 16384n,
+    弓: EQUIPMENT_TYPE_MASKS.bows,
+    箭袋: EQUIPMENT_TYPE_MASKS.quivers,
+    头部: EQUIPMENT_TYPE_MASKS.helmets,
+    头盔: EQUIPMENT_TYPE_MASKS.helmets,
+    胸甲: EQUIPMENT_TYPE_MASKS.bodyArmours,
+    手套: EQUIPMENT_TYPE_MASKS.gloves,
+    鞋子: EQUIPMENT_TYPE_MASKS.boots,
+    靴子: EQUIPMENT_TYPE_MASKS.boots,
+    盾牌: EQUIPMENT_TYPE_MASKS.shields,
+    腰带: EQUIPMENT_TYPE_MASKS.belts,
+    项链: EQUIPMENT_TYPE_MASKS.amulets,
+    戒指: EQUIPMENT_TYPE_MASKS.rings,
+    赤红珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    翠绿珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    钴蓝珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    三相珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    凶残之凝珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    安睡之凝珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    锐利之凝珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    苍白之凝珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    大型星团珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    中型星团珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    小型星团珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+    珠宝: EQUIPMENT_TYPE_MASKS.jewels,
+  };
+
   const CRAFT_BENCH_CATEGORY_OPTIONS = [
     { value: 'oneHandWeapons', label: '单手武器', mask: EQUIPMENT_TYPE_MASKS.oneHandWeapons },
     { value: 'twoHandWeapons', label: '双手武器', mask: EQUIPMENT_TYPE_MASKS.twoHandWeapons },
@@ -2169,7 +2217,7 @@
       value: 'weapons',
       label: '武器',
       mask: EQUIPMENT_TYPE_MASKS.oneHandWeapons | EQUIPMENT_TYPE_MASKS.twoHandWeapons | EQUIPMENT_TYPE_MASKS.bows,
-      sampleTypes: [1n, 512n, 2048n],
+      sampleTypes: [1n],
     },
     {
       value: 'armours',
@@ -2179,13 +2227,13 @@
         | EQUIPMENT_TYPE_MASKS.gloves
         | EQUIPMENT_TYPE_MASKS.boots
         | EQUIPMENT_TYPE_MASKS.shields,
-      sampleTypes: [17179869184n, 134217728n, 1048576n, 2097152n, 1099511627776n],
+      sampleTypes: [17179869184n],
     },
     {
       value: 'jewelry',
       label: '项链/戒指/腰带',
       mask: EQUIPMENT_TYPE_MASKS.amulets | EQUIPMENT_TYPE_MASKS.rings | EQUIPMENT_TYPE_MASKS.belts,
-      sampleTypes: [EQUIPMENT_TYPE_MASKS.amulets, EQUIPMENT_TYPE_MASKS.rings, EQUIPMENT_TYPE_MASKS.belts],
+      sampleTypes: [EQUIPMENT_TYPE_MASKS.amulets],
     },
   ];
 
@@ -7200,6 +7248,9 @@
     'affixRollMinimum',
     'craftedRollAverage',
     'craftedRollMinimum',
+    'uniqueAffixRollAverage',
+    'groupAffixRollMinimum',
+    'groupAffixRollAverage',
   ]);
 
   const SHARE_SPECIAL_OPERATOR_ENUM = createShareEnum([
@@ -7340,7 +7391,6 @@
 
   const sanitizeAssistantSettings = (settings = {}) => ({
     themeMode: Object.values(THEME_MODES).includes(settings.themeMode) ? settings.themeMode : THEME_MODES.auto,
-    speedMode: normalizeSpeedMode(settings.speedMode || 'normal'),
     logMode: normalizeLogMode(settings.logMode || 'main'),
     minimizePausesAutomation: settings.minimizePausesAutomation === true || settings.minimizePausesAutomation === 'true',
     stepActionSafetyLimit: clampPositiveInteger(settings.stepActionSafetyLimit, 500, 1, 100000),
@@ -7357,7 +7407,6 @@
 
   const getCurrentAssistantSettingsSnapshot = () => sanitizeAssistantSettings({
       themeMode: state.themeMode,
-      speedMode: state.speedMode,
       logMode: state.logMode,
       minimizePausesAutomation: state.minimizePausesAutomation,
       stepActionSafetyLimit: state.stepActionSafetyLimit,
@@ -7385,7 +7434,15 @@
 
   clearTransientAssistantStorage();
 
+  const readAutomationSpeedMode = () => {
+    const storedSpeedMode = getAssistantStorageValue(STORAGE_KEYS.automationSpeed, null);
+    if (storedSpeedMode !== null) return normalizeSpeedMode(storedSpeedMode);
+    setAssistantStorageValue(STORAGE_KEYS.automationSpeed, 'fast');
+    return 'fast';
+  };
+
   const assistantSettings = readAssistantSettings();
+  const automationSpeedMode = readAutomationSpeedMode();
 
   writeAssistantStorageJson(STORAGE_KEYS.settings, assistantSettings);
 
@@ -7417,7 +7474,7 @@
     /** customCraftCurrencyLimit 是自定义打造单个任务允许消耗的总通货上限。 */
     customCraftCurrencyLimit: assistantSettings.customCraftCurrencyLimit,
     /** speedMode 记录当前速度档位。 */
-    speedMode: assistantSettings.speedMode,
+    speedMode: automationSpeedMode,
     /** logMode 记录当前日志密度。 */
     logMode: assistantSettings.logMode,
     /** useStorage 表示是否从储藏位置而不是背包读取装备。 */
@@ -7440,6 +7497,13 @@
     skillStones: [],
     /** hasLoadedSkillStones 表示技能石列表是否已成功加载，用于禁用误操作按钮。 */
     hasLoadedSkillStones: false,
+    /** skillStoneDetailCache/Requests 缓存本次页面会话读取过的单颗详情，并合并同一 ID 的并发读取。 */
+    skillStoneDetailCache: new Map(),
+    skillStoneDetailRequests: new Map(),
+    /** requestCooldownUntil 保存服务器 429 后的全局请求冷却截止时间。 */
+    requestCooldownUntil: 0,
+    /** requestQueueTail 把所有 FPOE API 请求接入同一条串行队列。 */
+    requestQueueTail: Promise.resolve(),
     /** practiceSkillStoneCache 保存加载技能石时同步获得的练习孔位缓存，调整位置时不再重复查询。 */
     practiceSkillStoneCache: {
       loaded: false,
@@ -7578,14 +7642,13 @@
     maxLoopAttempts: 500,
     /**
      * requestRetry 控制接口短暂断线时的自动重连。
-     * 打造装备会大量连续请求，服务器偶发 502/503/504 时自动等待重试，避免整轮任务直接中断。
+     * 除用户主动停止外，所有 HTTP、超时和网络失败都按 5/15/30 秒最多重试 3 次。
      */
     requestRetry: {
-      maxAttempts: 5,
-      baseDelayMs: 1200,
-      timeoutDelayMs: 3000,
-      maxDelayMs: 8000,
-      statuses: [502, 503, 504, 524],
+      maxAttempts: 4,
+      retryDelayMs: [5000, 15000, 30000],
+      requestTimeoutMs: 30000,
+      timeoutDelayMs: 5000,
     },
     /** endpoints 保存脚本使用的后端接口。 */
     endpoints: {
@@ -7628,22 +7691,19 @@
    */
   const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-  const runConcurrentTasks = async (items, concurrency, worker) => {
+  /**
+   * runConcurrentTasks 保留旧调用签名，但现在严格按输入顺序串行执行。
+   * 所有自动化和只读扫描共用这一入口，避免多个请求同时到达服务器。
+   */
+  const runConcurrentTasks = async (items, _concurrency, worker) => {
     const results = new Array(items.length);
-    let nextIndex = 0;
-    const workerCount = Math.max(1, Math.min(Math.floor(Number(concurrency) || 1), items.length || 1));
-    const runners = Array.from({ length: workerCount }, async () => {
-      while (state.isRunning && nextIndex < items.length) {
-        const itemIndex = nextIndex;
-        nextIndex += 1;
-        try {
-          results[itemIndex] = await worker(items[itemIndex], itemIndex);
-        } catch (error) {
-          results[itemIndex] = { error };
-        }
+    for (let itemIndex = 0; state.isRunning && itemIndex < items.length; itemIndex += 1) {
+      try {
+        results[itemIndex] = await worker(items[itemIndex], itemIndex);
+      } catch (error) {
+        results[itemIndex] = { error };
       }
-    });
-    await Promise.all(runners);
+    }
     return results;
   };
 
@@ -7725,7 +7785,7 @@
 
   const setSpeedMode = (nextSpeedMode) => {
     state.speedMode = normalizeSpeedMode(nextSpeedMode);
-    updateAssistantSetting('speedMode', state.speedMode);
+    setAssistantStorageValue(STORAGE_KEYS.automationSpeed, state.speedMode);
     if (state.ui.speedSelect) setInputValue(state.ui.speedSelect, state.speedMode);
     addLog(`自动化速度已切换为：${SPEED_OPTIONS[state.speedMode].label}。`, 'compact');
   };
@@ -7794,16 +7854,14 @@
 
   /**
    * isRetryableRequestFailure 判断一次接口失败是否适合自动重试。
-   * 只重试短暂服务不可用或浏览器网络瞬断，不重试业务错误，避免重复提交确定失败的操作。
+   * 除用户主动中断外，请求层捕获的任何错误都进入统一重试。
    * @param {Error} error 捕获到的异常。
    * @param {Response|null} response fetch 返回的响应对象。
    * @returns {boolean} 可以重试时返回 true。
    */
   const isRetryableRequestFailure = (error, response) => {
     if (isRequestAbortError(error)) return false;
-    if (response && config.requestRetry.statuses.includes(response.status)) return true;
-    if (!response && error instanceof TypeError) return true;
-    return false;
+    return Boolean(response || error);
   };
 
   /**
@@ -7811,11 +7869,35 @@
    * @param {number} attemptIndex 当前失败次数，从 1 开始。
    * @returns {number} 等待毫秒数。
    */
-  const getRequestRetryDelay = (attemptIndex, response = null) => {
-    if (response?.status === 524) return config.requestRetry.timeoutDelayMs;
-    return Math.min(
-      config.requestRetry.maxDelayMs,
-      config.requestRetry.baseDelayMs * attemptIndex,
+  const getRequestRetryAfterDelay = (response) => {
+    const retryAfter = String(response?.headers?.get?.('Retry-After') || '').trim();
+    if (!retryAfter) return 0;
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.max(0, Math.ceil(seconds * 1000));
+    const retryAt = Date.parse(retryAfter);
+    return Number.isFinite(retryAt) ? Math.max(0, retryAt - Date.now()) : 0;
+  };
+
+  const getRequestRetryDelay = (attemptIndex, response = null, error = null) => {
+    if (response?.status === 429) {
+      const serverRetryAfterMs = getRequestRetryAfterDelay(response);
+      if (serverRetryAfterMs > 0) return serverRetryAfterMs + 1000;
+    }
+    const retryDelays = config.requestRetry.retryDelayMs;
+    const retryDelayIndex = Math.max(0, Math.min(attemptIndex - 1, retryDelays.length - 1));
+    return retryDelays[retryDelayIndex];
+  };
+
+  const waitForRequestCooldown = async () => {
+    const remainingMs = Math.max(0, Number(state.requestCooldownUntil || 0) - Date.now());
+    if (remainingMs > 0) await wait(remainingMs);
+  };
+
+  const extendRequestCooldown = (delayMs) => {
+    const safeDelayMs = Math.max(0, Number(delayMs || 0));
+    state.requestCooldownUntil = Math.max(
+      Number(state.requestCooldownUntil || 0),
+      Date.now() + safeDelayMs,
     );
   };
 
@@ -7825,16 +7907,33 @@
    * @param {object} options fetch 参数。
    * @returns {Promise<object>} 接口返回的 JSON。
    */
-  const requestJson = async (url, options = {}) => {
+  const executeRequestJson = async (url, options = {}) => {
     assertLoggedIn();
     let lastError = null;
     for (let attemptIndex = 1; attemptIndex <= config.requestRetry.maxAttempts; attemptIndex += 1) {
       let response = null;
+      let requestTimeoutId = null;
+      let taskAbortHandler = null;
+      let timedOut = false;
+      const taskSignal = state.abortController?.signal;
       try {
+        await waitForRequestCooldown();
+        if (taskSignal?.aborted) {
+          const abortError = new Error('请求已由用户停止');
+          abortError.name = 'AbortError';
+          throw abortError;
+        }
+        const requestController = new AbortController();
+        taskAbortHandler = () => requestController.abort();
+        taskSignal?.addEventListener('abort', taskAbortHandler, { once: true });
+        requestTimeoutId = window.setTimeout(() => {
+          timedOut = true;
+          requestController.abort();
+        }, config.requestRetry.requestTimeoutMs);
         const requestOptions = {
           method: options.method || 'GET',
           cache: 'no-cache',
-          signal: state.abortController?.signal,
+          signal: requestController.signal,
           headers: {
             Accept: 'application/json',
             Authorization: getAuthorizationHeader(),
@@ -7854,16 +7953,61 @@
         }
         return payload;
       } catch (error) {
+        if (timedOut && isRequestAbortError(error)) {
+          const timeoutError = new Error(`请求 ${config.requestRetry.requestTimeoutMs / 1000} 秒未返回`);
+          timeoutError.name = 'RequestTimeoutError';
+          error = timeoutError;
+        }
         lastError = error;
-        const canRetry = attemptIndex < config.requestRetry.maxAttempts && isRetryableRequestFailure(error, response);
+        const delayMs = getRequestRetryDelay(attemptIndex, response, error);
+        const noRetryHttpStatuses = Array.isArray(options.noRetryHttpStatuses)
+          ? options.noRetryHttpStatuses.map(Number)
+          : [];
+        const canRetry = attemptIndex < config.requestRetry.maxAttempts
+          && !noRetryHttpStatuses.includes(Number(response?.status))
+          && isRetryableRequestFailure(error, response);
+        if (response?.status === 429) {
+          extendRequestCooldown(delayMs);
+          const serverRetryAfterMs = getRequestRetryAfterDelay(response);
+          const delaySeconds = Math.max(0, delayMs / 1000);
+          const delayText = Number.isInteger(delaySeconds)
+            ? `${delaySeconds} 秒`
+            : `${delaySeconds.toFixed(1)} 秒`;
+          addLog(
+            canRetry
+              ? `请求触发 HTTP 429：${serverRetryAfterMs > 0 ? '按服务器 Retry-After' : ''}等待 ${delayText} 后重试。`
+              : '请求触发 HTTP 429：已达到重试上限。',
+            'warn',
+          );
+        }
         if (!canRetry) break;
-        const delayMs = getRequestRetryDelay(attemptIndex, response);
-        console.warn(`[AssistantV2] 接口短暂不可用，${delayMs}ms 后重试：第 ${attemptIndex}/${config.requestRetry.maxAttempts} 次失败，${response?.status || error.message}`);
+        console.warn(`[AssistantV2] 接口短暂不可用，${delayMs}ms 后重试：第 ${attemptIndex}/${config.requestRetry.maxAttempts - 1} 次重试，${response?.status || error.message}`);
         await wait(delayMs);
+      } finally {
+        if (requestTimeoutId !== null) window.clearTimeout(requestTimeoutId);
+        if (taskAbortHandler) taskSignal?.removeEventListener('abort', taskAbortHandler);
       }
     }
     throw lastError || new Error('接口请求失败');
   };
+
+  const runSerializedRequest = async (requestWorker) => {
+    const previousRequest = state.requestQueueTail;
+    let releaseRequest;
+    state.requestQueueTail = new Promise((resolve) => {
+      releaseRequest = resolve;
+    });
+    await previousRequest.catch(() => {});
+    try {
+      return await requestWorker();
+    } finally {
+      releaseRequest();
+    }
+  };
+
+  const requestJson = (url, options = {}) => runSerializedRequest(
+    () => executeRequestJson(url, options),
+  );
 
   /**
    * extractJsonObjects 从混合文本中提取一个或多个 JSON 对象。
@@ -10492,9 +10636,11 @@
   let skillTreeDataRequestPromise = null;
 
   const fetchSkillTreeResourceText = async (url, label) => {
-    const response = await fetch(url, { method: 'GET', credentials: 'same-origin' });
-    if (!response.ok) throw new Error(`${label}读取失败：HTTP ${response.status}`);
-    return response.text();
+    return runSerializedRequest(async () => {
+      const response = await fetch(url, { method: 'GET', credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`${label}读取失败：HTTP ${response.status}`);
+      return response.text();
+    });
   };
 
   const resolveCurrentSkillTreeDataUrl = async () => {
@@ -10534,9 +10680,11 @@
     skillTreeDataRequestPromise = (async () => {
       try {
         const treeDataUrl = await resolveCurrentSkillTreeDataUrl();
-        const response = await fetch(treeDataUrl, { method: 'GET', credentials: 'same-origin' });
-        if (!response.ok) throw new Error(`天赋树静态数据读取失败：HTTP ${response.status}`);
-        const data = await response.json();
+        const data = await runSerializedRequest(async () => {
+          const response = await fetch(treeDataUrl, { method: 'GET', credentials: 'same-origin' });
+          if (!response.ok) throw new Error(`天赋树静态数据读取失败：HTTP ${response.status}`);
+          return response.json();
+        });
         if (!data?.nodes || typeof data.nodes !== 'object' || !String(data.version || '')) {
           throw new Error('天赋树静态数据结构不完整');
         }
@@ -10558,11 +10706,9 @@
   };
 
   const exportSkillTree = async () => {
-    const [payload, treePayload, characterPayload] = await Promise.all([
-      requestJson(config.endpoints.skillTree),
-      fetchSkillTreeData(),
-      requestJson(config.endpoints.character),
-    ]);
+    const payload = await requestJson(config.endpoints.skillTree);
+    const treePayload = await fetchSkillTreeData();
+    const characterPayload = await requestJson(config.endpoints.character);
     if (payload?.success === false || !payload?.data) throw new Error(payload?.message || '读取天赋失败。');
     if (!treePayload?.data) throw new Error('读取当前版本天赋节点字典失败。');
     if (!characterPayload?.data) throw new Error('读取当前角色职业失败。');
@@ -10646,11 +10792,9 @@
   const importSkillTreeToPage = async () => {
     if (!/^\/skilltree\/?$/.test(location.pathname)) throw new Error('导入天赋必须在网页“天赋”页面执行。');
     const importText = state.ui.skillTreeTransferText?.value;
-    const [currentPayload, treePayload, characterPayload] = await Promise.all([
-      requestJson(config.endpoints.skillTree),
-      fetchSkillTreeData(),
-      requestJson(config.endpoints.character),
-    ]);
+    const currentPayload = await requestJson(config.endpoints.skillTree);
+    const treePayload = await fetchSkillTreeData();
+    const characterPayload = await requestJson(config.endpoints.character);
     if (!currentPayload?.data || !treePayload?.data || !characterPayload?.data) throw new Error('读取当前天赋页面数据失败。');
     const imported = decodeSkillTreeExport(importText, {
       treeData: treePayload.data,
@@ -10704,10 +10848,8 @@
       return;
     }
     try {
-      const [currentPayload, treePayload] = await Promise.all([
-        requestJson(config.endpoints.skillTree),
-        fetchSkillTreeData(),
-      ]);
+      const currentPayload = await requestJson(config.endpoints.skillTree);
+      const treePayload = await fetchSkillTreeData();
       if (requestId !== skillTreeJewelPreviewRequestId) return;
       if (!currentPayload?.data || !treePayload?.data) throw new Error('读取当前天赋版本失败');
       const imported = decodeSkillTreeExport(importText, {
@@ -10934,7 +11076,7 @@
   const parseEquipmentTypeMask = (value) => {
     if (value === undefined || value === null || value === '') return 0n;
     const label = String(value).trim();
-    if (AFFIX_PICKER_EQUIPMENT_MASKS[label]) return AFFIX_PICKER_EQUIPMENT_MASKS[label];
+    if (CRAFT_EQUIPMENT_TYPE_LABEL_MASKS[label]) return CRAFT_EQUIPMENT_TYPE_LABEL_MASKS[label];
     try {
       return BigInt(label);
     } catch (error) {
@@ -10952,7 +11094,7 @@
       craft?.affix?.name,
       craft?.affix?.displayName,
       craft?.searchText,
-    ].map((value) => String(value || '').trim()).filter(Boolean).join(' ');
+    ].map((entry) => String(entry || '').trim()).filter(Boolean).join(' ');
     return /随机重掷稀有物品上的\s*(?:1|3)\s*条词缀/.test(text);
   };
 
@@ -11059,6 +11201,30 @@
     };
   };
 
+  const isCraftMagicFormatterTable = (candidate) => {
+    if (!candidate || typeof candidate !== 'object') return false;
+    let formatterCount = 0;
+    for (const [magicId, formatter] of Object.entries(candidate)) {
+      if (/^\d+$/.test(magicId) && typeof formatter === 'function') formatterCount += 1;
+      if (formatterCount >= 20) return true;
+    }
+    return false;
+  };
+
+  const loadCraftMagicFormattersFromGameCoreAsset = async () => {
+    const gameCoreAssetUrl = [...document.querySelectorAll('script[src], link[href]')]
+      .map((element) => element.src || element.href || '')
+      .find((url) => /\/assets\/game-core-[^/]+\.js(?:[?#].*)?$/.test(url));
+    if (!gameCoreAssetUrl) throw new Error('当前页面未发现 game-core 属性名称资源');
+    const moduleLoader = Function('assetUrl', 'return import(assetUrl)');
+    const gameCoreModule = await moduleLoader(gameCoreAssetUrl);
+    const formatters = isCraftMagicFormatterTable(gameCoreModule?.G)
+      ? gameCoreModule.G
+      : Object.values(gameCoreModule || {}).find((candidate) => isCraftMagicFormatterTable(candidate));
+    if (!formatters) throw new Error('game-core 属性名称表结构无法识别');
+    return formatters;
+  };
+
   const installCraftMagicFormattersFromBattleAsset = async () => {
     if (state.craftBench.magicFormatters) return state.craftBench.magicFormatters;
     if (state.craftBench.magicFormattersLoadingPromise) return state.craftBench.magicFormattersLoadingPromise;
@@ -11067,22 +11233,33 @@
       // 网页入口模块会把完整 magic 渲染表挂到 window.magics。脚本在
       // DOMContentLoaded 后初始化时应优先复用它，避免重新解析资源时先把
       // 工艺标签缓存成“属性 ID + 数值”。
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
         const pageFormatters = pageWindow.magics || pageWindow.bt;
-        if (pageFormatters && typeof pageFormatters === 'object') {
+        if (isCraftMagicFormatterTable(pageFormatters)) {
           state.craftBench.magicFormatters = pageFormatters;
           return pageFormatters;
         }
         await new Promise((resolve) => window.setTimeout(resolve, 50));
       }
 
+      try {
+        const gameCoreFormatters = await loadCraftMagicFormattersFromGameCoreAsset();
+        state.craftBench.magicFormatters = gameCoreFormatters;
+        if (!isCraftMagicFormatterTable(pageWindow.magics)) pageWindow.magics = gameCoreFormatters;
+        return gameCoreFormatters;
+      } catch (gameCoreError) {
+        addTraceLog(`game-core 工艺属性名称表读取失败，尝试兼容旧版 battle 资源：${gameCoreError.message}`);
+      }
+
       const battleAssetUrl = [...document.querySelectorAll('script[src], link[href]')]
         .map((element) => element.src || element.href || '')
         .find((url) => /\/assets\/battle-[^/]+\.js(?:[?#].*)?$/.test(url));
       if (!battleAssetUrl) throw new Error('当前页面未发现 battle 属性名称资源');
-      const response = await fetch(battleAssetUrl);
-      if (!response.ok) throw new Error(`battle 属性名称资源读取失败（HTTP ${response.status}）`);
-      const sourceText = await response.text();
+      const sourceText = await runSerializedRequest(async () => {
+        const response = await fetch(battleAssetUrl);
+        if (!response.ok) throw new Error(`battle 属性名称资源读取失败（HTTP ${response.status}）`);
+        return response.text();
+      });
       const objectLiteral = extractObjectLiteralByPrefix(sourceText, 'bt=');
       if (!objectLiteral) throw new Error('battle 属性名称表结构无法识别');
       const helpers = createCraftMagicFormatterHelpers();
@@ -11095,6 +11272,7 @@
         'yn',
         `"use strict"; return (${objectLiteral});`,
       )(helpers.nt, helpers.t, helpers.yi, helpers.dt, helpers.Fe, helpers.yn);
+      if (!isCraftMagicFormatterTable(formatters)) throw new Error('battle 属性名称表校验失败');
       state.craftBench.magicFormatters = formatters;
       if (!pageWindow.magics) pageWindow.magics = formatters;
       return formatters;
@@ -11278,7 +11456,9 @@
   };
 
   const fetchGardenCraftRawList = async (equipmentTypeMask) => {
-    const payload = await requestJson(`${config.endpoints.gardenList}/${equipmentTypeMask.toString()}?_=${Date.now()}`);
+    const payload = await requestJson(`${config.endpoints.gardenList}/${equipmentTypeMask.toString()}?_=${Date.now()}`, {
+      noRetryHttpStatuses: [400],
+    });
     if (payload.success === false) throw new Error(payload.message || '花园工艺列表读取失败');
     const data = payload.data || {};
     return [
@@ -11314,24 +11494,7 @@
 
   const fetchGardenCraftListByCategory = async (categoryValue) => {
     const category = getGardenCraftCategory(categoryValue);
-    let rawItems;
-    let usedSampleFallback = false;
-    try {
-      rawItems = await fetchGardenCraftRawList(category.mask);
-    } catch (error) {
-      if (
-        !isInvalidGardenCraftEquipmentTypeError(error)
-        || !Array.isArray(category.sampleTypes)
-        || !category.sampleTypes.length
-      ) {
-        throw error;
-      }
-      rawItems = await fetchGardenCraftRawListFromSamples(category);
-      usedSampleFallback = true;
-    }
-    if (!rawItems.length && Array.isArray(category.sampleTypes)) {
-      if (!usedSampleFallback) rawItems = await fetchGardenCraftRawListFromSamples(category);
-    }
+    const rawItems = await fetchGardenCraftRawListFromSamples(category);
     const list = rawItems
       .map(normalizeGardenCraftItem)
       .filter((item) => item.key && (item.type === 'catalyst' ? Number.isFinite(item.catalystType) : Number.isFinite(item.enchantmentId)))
@@ -11804,7 +11967,10 @@
       method: 'POST',
       body: { stoneId, type: modifyType },
     });
-    if (payload.success !== false) recordCurrencyUsage(modifyType);
+    if (payload.success !== false) {
+      state.skillStoneDetailCache.delete(stoneId);
+      recordCurrencyUsage(modifyType);
+    }
     return payload;
   };
 
@@ -11814,10 +11980,14 @@
    * @param {string} stoneId 技能石 ID。
    * @returns {Promise<object>} 后端返回的技能石升级结果。
    */
-  const upgradeSkillStone = (stoneId) => requestJson(config.endpoints.skillStoneUpgrade, {
-    method: 'POST',
-    body: { stoneId },
-  });
+  const upgradeSkillStone = async (stoneId) => {
+    const payload = await requestJson(config.endpoints.skillStoneUpgrade, {
+      method: 'POST',
+      body: { stoneId },
+    });
+    if (payload.success !== false) state.skillStoneDetailCache.delete(stoneId);
+    return payload;
+  };
 
   /**
    * destroySkillStones 调用技能石丢弃接口。
@@ -11834,24 +12004,29 @@
    * @param {string} stoneId 技能石 ID。
    * @returns {Promise<object|null>} 技能石详情；读取失败时返回 null。
    */
-  const fetchSkillStoneDetail = async (stoneId) => {
+  const fetchSkillStoneDetail = async (stoneId, forceRefresh = false) => {
     if (!stoneId) return null;
-    let lastError = null;
-    for (let attemptIndex = 1; attemptIndex <= 2; attemptIndex += 1) {
+    if (forceRefresh) state.skillStoneDetailCache.delete(stoneId);
+    if (state.skillStoneDetailCache.has(stoneId)) return state.skillStoneDetailCache.get(stoneId);
+    if (state.skillStoneDetailRequests.has(stoneId)) return state.skillStoneDetailRequests.get(stoneId);
+    const detailRequest = (async () => {
       try {
         const payload = await requestJson(`${config.endpoints.skillStoneDetail}/${stoneId}`);
         if (payload.success === false) throw new Error(payload.message || '技能石详情读取失败');
-        return payload.data?.stone || payload.data?.skillStone || payload.data || null;
+        const detail = payload.data?.stone || payload.data?.skillStone || payload.data || null;
+        if (detail) state.skillStoneDetailCache.set(stoneId, detail);
+        return detail;
       } catch (error) {
-        lastError = error;
-        if (attemptIndex < 2) {
-          addLog(`技能石详情读取失败，准备重试 1 次：${stoneId}，${error.message}`, 'detail');
-          continue;
-        }
+        addLog(`技能石详情读取失败：${stoneId}，${error?.message || error}`, 'warn');
+        return null;
       }
+    })();
+    state.skillStoneDetailRequests.set(stoneId, detailRequest);
+    try {
+      return await detailRequest;
+    } finally {
+      state.skillStoneDetailRequests.delete(stoneId);
     }
-    addLog(`技能石详情读取失败：${stoneId}，已重试 1 次，${lastError?.message || lastError}`, 'warn');
-    return null;
   };
 
   /**
@@ -11871,24 +12046,81 @@
     };
   };
 
+  const mergeSkillStoneDetail = (stone, detail, isCompleteDetail = false) => {
+    if (!stone || !detail) return stone;
+    const normalized = normalizeSkillStone({ ...stone, ...detail });
+    normalized.hasQualityData = isCompleteDetail || stone.hasQualityData || hasSkillStoneQualityField(detail);
+    normalized.hasCorruptedData = isCompleteDetail || stone.hasCorruptedData || hasSkillStoneCorruptedField(detail);
+    normalized.hasCompleteDetailSnapshot = isCompleteDetail || stone.hasCompleteDetailSnapshot;
+    Object.assign(stone, normalized);
+    if (stone.id) {
+      state.skillStoneDetailCache.set(stone.id, {
+        ...(state.skillStoneDetailCache.get(stone.id) || {}),
+        ...detail,
+      });
+    }
+    return stone;
+  };
+
   /**
-   * enrichSkillStoneWithDetail 单独读取技能石详情并和基础数据合并。
-   * 背包分页接口有时不会返回 corrupted 等关键字段，因此列表中的每颗技能石都要再读一次详情。
-   * @param {object} stone 基础技能石数据。
-   * @param {object} sourceMeta 来源信息。
-   * @returns {Promise<object>} 标准化后的技能石。
+   * syncSkillStoneLocalStateToCache 把动作完成后的本地技能石状态写回会话缓存。
+   * 这样升级、品质、腐化和移动孔位后，后续动作仍可复用“加载技能石”建立的完整快照。
    */
+  const syncSkillStoneLocalStateToCache = (stone) => {
+    if (!stone?.id) return;
+    state.skillStoneDetailCache.set(stone.id, {
+      ...(state.skillStoneDetailCache.get(stone.id) || {}),
+      ...stone,
+      id: stone.id,
+      stoneId: stone.id,
+    });
+  };
+
+  const ensureSkillStoneDetailFields = async (stone, requiredFields = []) => {
+    if (!stone?.id) return false;
+    const missingField = requiredFields.some((field) => {
+      if (field === 'quality') return !stone.hasQualityData;
+      if (field === 'corrupted') return !stone.hasCorruptedData;
+      if (field === 'practice') {
+        return !stone.hasPracticeProgressData
+          || !stone.hasCategoryData
+          || getPracticeSkillStoneActiveState(stone) === null
+          || (isExceptionalSkillStone(stone) && !stone.hasQualityData);
+      }
+      return false;
+    });
+    if (!missingField) return true;
+    // “加载技能石”已经成功读过完整详情时，不再为服务端本来就未提供的字段重复请求。
+    // 只有首次详情读取失败的技能石，动作阶段才允许针对该颗补查。
+    if (stone.hasCompleteDetailSnapshot) return false;
+    const detail = await fetchSkillStoneDetail(stone.id);
+    if (!detail) return false;
+    mergeSkillStoneDetail(stone, detail, true);
+    return requiredFields.every((field) => {
+      if (field === 'quality') return stone.hasQualityData;
+      if (field === 'corrupted') return stone.hasCorruptedData;
+      if (field === 'practice') {
+        return stone.hasPracticeProgressData
+          && stone.hasCategoryData
+          && getPracticeSkillStoneActiveState(stone) !== null
+          && (!isExceptionalSkillStone(stone) || stone.hasQualityData);
+      }
+      return true;
+    });
+  };
+
   const enrichSkillStoneWithDetail = async (stone, sourceMeta) => {
-    const baseStone = normalizeSkillStone({ ...stone, ...sourceMeta });
-    if (!baseStone.id) return baseStone;
-    const detail = await fetchSkillStoneDetail(baseStone.id);
-    return normalizeSkillStone({ ...baseStone, ...(detail || {}), ...sourceMeta });
+    const normalizedStone = normalizeSkillStone({ ...stone, ...sourceMeta });
+    if (!normalizedStone.id) return normalizedStone;
+    const detail = await fetchSkillStoneDetail(normalizedStone.id, true);
+    if (detail) mergeSkillStoneDetail(normalizedStone, detail, true);
+    return normalizedStone;
   };
 
   /**
    * fetchAllBackpackSkillStones 读取当前背包里的全部技能石。
    * 该接口默认一页 30 条，分页读取时单页失败会记录并继续，尽量不让局部失败破坏整次刷新。
-   * 分页拿到列表后会再逐颗读取详情，确保腐化状态等字段准确。
+   * 分页读取完成后逐颗串行读取详情，确保品质、腐化、标签和主动/辅助信息完整。
    * @returns {Promise<Array<object>>} 标准化后的技能石列表。
    */
   const fetchAllBackpackSkillStones = async () => {
@@ -11905,25 +12137,26 @@
         addLog(`技能石第 ${page} 页读取失败：${error.message}`, 'warn');
       }
     }
-    let loadedDetailCount = 0;
-    const normalizedStones = await runConcurrentTasks(stoneList, SKILL_STONE_DETAIL_CONCURRENCY, async (stone) => {
-      if (!state.isRunning && state.currentTaskName === '加载技能石') return null;
+    const normalizedStones = [];
+    for (const [stoneIndex, stone] of stoneList.entries()) {
+      if (!state.isRunning && state.currentTaskName === '加载技能石') break;
       const normalizedStone = await enrichSkillStoneWithDetail(stone, {
         source: 'backpack',
         sourceLabel: '背包',
       });
-      loadedDetailCount += 1;
-      if (loadedDetailCount % 10 === 0 || loadedDetailCount === stoneList.length) {
-        addLog(`背包技能石详情读取进度：${loadedDetailCount}/${stoneList.length}，并发 ${SKILL_STONE_DETAIL_CONCURRENCY} 个。`, 'info');
+      if (normalizedStone?.id) normalizedStones.push(normalizedStone);
+      const loadedCount = stoneIndex + 1;
+      if (loadedCount % 10 === 0 || loadedCount === stoneList.length) {
+        addLog(`背包技能石详情串行读取进度：${loadedCount}/${stoneList.length}。`, 'info');
       }
-      return normalizedStone;
-    });
-    return normalizedStones.filter((stone) => stone?.id);
+      if (loadedCount < stoneList.length) await wait(getSpeedDelay());
+    }
+    return normalizedStones;
   };
 
   /**
    * fetchEquippedSkillStones 从角色装备槽里读取所有已镶嵌技能石。
-   * 装备槽只稳定暴露 stoneId 和 socket 信息，因此会尽量再读取详情；详情失败时保留可操作的 ID。
+   * 角色接口提供孔位信息后，再逐颗串行读取技能石详情。
    * @returns {Promise<Array<object>>} 标准化后的装备镶嵌技能石列表。
    */
   const fetchEquippedSkillStones = async () => {
@@ -12023,8 +12256,8 @@
     if (invalidPracticeSocketCount) {
       addLog(`智能练技能跳过 ${invalidPracticeSocketCount} 个孔位：接口没有返回孔位颜色，无法安全判断可镶嵌宝石。`, 'warn');
     }
-    let loadedEquipmentDetailCount = 0;
-    const normalizedStones = await runConcurrentTasks(socketStones, SKILL_STONE_DETAIL_CONCURRENCY, async (socketStone) => {
+    const normalizedStones = [];
+    for (const [stoneIndex, socketStone] of socketStones.entries()) {
       const normalizedStone = await enrichSkillStoneWithDetail(socketStone, {
         source: 'equipment',
         sourceLabel: socketStone.sourceLabel,
@@ -12033,13 +12266,14 @@
         socketId: socketStone.socketId,
         socketType: socketStone.socketType,
       });
-      loadedEquipmentDetailCount += 1;
-      if (loadedEquipmentDetailCount % 10 === 0 || loadedEquipmentDetailCount === socketStones.length) {
-        addLog(`装备技能石详情读取进度：${loadedEquipmentDetailCount}/${socketStones.length}，并发 ${SKILL_STONE_DETAIL_CONCURRENCY} 个。`, 'info');
+      if (normalizedStone?.id) normalizedStones.push(normalizedStone);
+      const loadedCount = stoneIndex + 1;
+      if (loadedCount % 10 === 0 || loadedCount === socketStones.length) {
+        addLog(`装备技能石详情串行读取进度：${loadedCount}/${socketStones.length}。`, 'info');
       }
-      return normalizedStone;
-    });
-    return normalizedStones.filter((stone) => stone?.id);
+      if (loadedCount < socketStones.length) await wait(getSpeedDelay());
+    }
+    return normalizedStones;
   };
 
   /**
@@ -12054,17 +12288,17 @@
       excludedSummary: { active: 0, special: 0 },
       excludedEmptySockets: { active: [], special: [] },
     };
-    const [backpackResult, equippedResult] = await Promise.allSettled([
-      fetchAllBackpackSkillStones(),
-      fetchEquippedSkillStones(),
-    ]);
-    const backpackStones = backpackResult.status === 'fulfilled' ? backpackResult.value : [];
-    const equippedStones = equippedResult.status === 'fulfilled' ? equippedResult.value : [];
-    if (backpackResult.status === 'rejected') {
-      addLog(`背包技能石读取失败：${backpackResult.reason?.message || backpackResult.reason}`, 'error');
+    let backpackStones = [];
+    let equippedStones = [];
+    try {
+      backpackStones = await fetchAllBackpackSkillStones();
+    } catch (error) {
+      addLog(`背包技能石读取失败：${error?.message || error}`, 'error');
     }
-    if (equippedResult.status === 'rejected') {
-      addLog(`装备技能石读取失败：${equippedResult.reason?.message || equippedResult.reason}`, 'error');
+    try {
+      equippedStones = await fetchEquippedSkillStones();
+    } catch (error) {
+      addLog(`装备技能石读取失败：${error?.message || error}`, 'error');
     }
     const stoneById = new Map();
     for (const stone of [...backpackStones, ...equippedStones]) {
@@ -12079,6 +12313,18 @@
    * @param {object} stone 接口返回的技能石对象。
    * @returns {object} 标准化技能石对象。
    */
+  const hasDefinedOwnField = (object, fieldNames) => fieldNames.some((fieldName) => (
+    Object.prototype.hasOwnProperty.call(object || {}, fieldName)
+    && object[fieldName] !== undefined
+    && object[fieldName] !== null
+  ));
+
+  const hasSkillStoneQualityField = (stone) => hasDefinedOwnField(stone, ['quality', 'qualityBonus']);
+  const hasSkillStoneCorruptedField = (stone) => hasDefinedOwnField(
+    stone,
+    ['corrupted', 'isCorrupted', 'vaaled', 'isVaaled'],
+  );
+
   const normalizeSkillStone = (stone) => {
     const skillDefinition = stone.skill || stone.skillData || stone.gem || {};
     const tags = Array.isArray(stone.tags)
@@ -12108,8 +12354,8 @@
       sourceLabel: stone.sourceLabel || (stone.source === 'equipment' ? '装备' : '背包'),
       equipmentId: stone.equipmentId || '',
       equipmentName: stone.equipmentName || '',
-      socketId: stone.socketId || '',
-      socketType: stone.socketType || '',
+      socketId: stone.socketId ?? '',
+      socketType: stone.socketType ?? '',
       hasPracticeProgressData: typeof stone.hasPracticeProgressData === 'boolean'
         ? stone.hasPracticeProgressData
         : stone.level !== undefined && stone.levelUpExp !== undefined,
@@ -12119,6 +12365,13 @@
           || stone.socketType !== undefined
           || skillDefinition.category !== undefined
           || skillDefinition.socketType !== undefined,
+      hasQualityData: typeof stone.hasQualityData === 'boolean'
+        ? stone.hasQualityData
+        : hasSkillStoneQualityField(stone),
+      hasCorruptedData: typeof stone.hasCorruptedData === 'boolean'
+        ? stone.hasCorruptedData
+        : hasSkillStoneCorruptedField(stone),
+      hasCompleteDetailSnapshot: Boolean(stone.hasCompleteDetailSnapshot),
     };
   };
 
@@ -13165,6 +13418,8 @@
     affixRollMinimum: '全低Roll',
     craftedRollAverage: '工艺均Roll',
     craftedRollMinimum: '工艺低Roll',
+    groupAffixRollMinimum: '组内低Roll',
+    groupAffixRollAverage: '组内均Roll',
     uniqueAffixRollAverage: '暗金均Roll',
   };
 
@@ -13871,6 +14126,11 @@
     craftedRollMinimum: { affixTypes: [1, 2], aggregate: 'minimum', craftedOnly: true },
   };
 
+  const CONDITION_GROUP_AFFIX_ROLL_METRICS = {
+    groupAffixRollMinimum: 'minimum',
+    groupAffixRollAverage: 'average',
+  };
+
   const EQUIPMENT_TYPE_EXACT_AFFIX_KEYS = {
     单手剑: '单手剑',
     单手斧: '单手斧',
@@ -14466,6 +14726,73 @@
     return percentages.reduce((sum, value) => sum + value, 0) / percentages.length;
   };
 
+  /**
+   * getEquipmentAffixesMatchedByCondition 返回一个普通/工艺词缀条件在当前装备上命中的实际词缀。
+   * 条件组 Roll 聚合必须读取实际命中的词缀，不能把组内尚未出现的候选词缀算成 0。
+   * @param {object} equipment 当前装备。
+   * @param {object} condition 条件组中的单条条件。
+   * @returns {Array<object>} 命中的实际前后缀。
+   */
+  const getEquipmentAffixesMatchedByCondition = (equipment, condition) => {
+    const normalizedCondition = normalizeAffixCondition(condition);
+    if (
+      isSpecialCondition(normalizedCondition)
+      || isRollCondition(normalizedCondition)
+      || isCorruptedBaseCondition(normalizedCondition)
+    ) {
+      return [];
+    }
+    const affixes = (Array.isArray(equipment?.affixes) ? equipment.affixes : [])
+      .filter((affix) => [1, 2].includes(Number(affix?.type)));
+    if (normalizedCondition.craftId) {
+      const craft = getCraftBenchById(normalizedCondition.craftId);
+      return craft ? affixes.filter((affix) => doesEquipmentAffixMatchCraft(equipment, affix, craft)) : [];
+    }
+    const amuletSameNameT1Config = getAmuletSameNameT1Config(normalizedCondition);
+    if (
+      getGameEquipmentTypeLabel(equipment?.equipmentType) === '项链'
+      && normalizedCondition.name === AMULET_SAME_NAME_T1_AFFIX_NAME
+      && amuletSameNameT1Config
+    ) {
+      return affixes.filter((affix) => getAmuletSameNameT1EffectMatch({
+        ...equipment,
+        affixes: [affix],
+      }, normalizedCondition) === true);
+    }
+    const nameCompatibility = getAffixNameCompatibility(normalizedCondition);
+    const acceptedNames = isAffixNameCompatibilityEnabledForEquipment(nameCompatibility, equipment)
+      ? [nameCompatibility.oldName, nameCompatibility.currentName]
+      : [normalizedCondition.name];
+    return affixes.filter((affix) => acceptedNames.includes(
+      String(affix?.name || affix?.affixName || '').trim(),
+    ));
+  };
+
+  /**
+   * getConditionGroupAffixRollValue 计算同一条件组里当前已命中词缀的最低或平均 Roll。
+   * 每个实际词缀只统计一次；没有命中任何可计算词缀时返回 undefined，使该 Roll 条件不成立。
+   * @param {object} equipment 当前装备。
+   * @param {object} conditionGroup 当前条件所在的条件组。
+   * @param {'minimum'|'average'} aggregate 聚合方式。
+   * @returns {number|undefined} 0–100 的标准化 Roll 百分比。
+   */
+  const getConditionGroupAffixRollValue = (equipment, conditionGroup, aggregate) => {
+    const normalizedGroup = normalizeAffixConditionGroup(conditionGroup);
+    const matchedAffixes = [];
+    const seenAffixes = new Set();
+    normalizedGroup.conditions.forEach((condition) => {
+      getEquipmentAffixesMatchedByCondition(equipment, condition).forEach((affix) => {
+        if (seenAffixes.has(affix)) return;
+        seenAffixes.add(affix);
+        matchedAffixes.push(affix);
+      });
+    });
+    const percentages = matchedAffixes.flatMap((affix) => calculateAffixRollPercentages(equipment, affix));
+    if (!percentages.length) return undefined;
+    if (aggregate === 'minimum') return Math.min(...percentages);
+    return percentages.reduce((sum, value) => sum + value, 0) / percentages.length;
+  };
+
   const getSpecialConditionValue = (equipment, metric) => {
     const affixSummary = getMagicAffixSummary(equipment?.affixes);
     const affixSlotLimits = getAffixSlotLimits(equipment?.rarity, equipment);
@@ -14553,7 +14880,7 @@
       });
   };
 
-  const isConditionMatched = (equipment, condition, affixNames) => {
+  const isConditionMatched = (equipment, condition, affixNames, conditionGroup = null) => {
     const normalizedCondition = normalizeAffixCondition(condition);
     if (isSpecialCondition(normalizedCondition)) {
       return compareConditionValue(
@@ -14564,7 +14891,13 @@
     }
     if (isRollCondition(normalizedCondition)) {
       let currentValue;
-      if (normalizedCondition.metric === 'uniqueAffixRollAverage') {
+      if (CONDITION_GROUP_AFFIX_ROLL_METRICS[normalizedCondition.metric]) {
+        currentValue = getConditionGroupAffixRollValue(
+          equipment,
+          conditionGroup,
+          CONDITION_GROUP_AFFIX_ROLL_METRICS[normalizedCondition.metric],
+        );
+      } else if (normalizedCondition.metric === 'uniqueAffixRollAverage') {
         currentValue = getUniqueAffixRollAverage(equipment);
       } else if (AFFIX_ROLL_METRIC_SOURCES[normalizedCondition.metric]) {
         currentValue = getAffixRollConditionValue(equipment, normalizedCondition.metric);
@@ -14609,7 +14942,9 @@
       const normalizedGroup = normalizeAffixConditionGroup(group);
       const cleanGroup = normalizedGroup.conditions;
       if (!cleanGroup.length) return false;
-      const matchedCount = cleanGroup.filter((condition) => isConditionMatched(equipment, condition, affixNames)).length;
+      const matchedCount = cleanGroup
+        .filter((condition) => isConditionMatched(equipment, condition, affixNames, normalizedGroup))
+        .length;
       const requiredCount = Math.min(normalizedGroup.minRequired, cleanGroup.length);
       return matchedCount >= requiredCount;
     });
@@ -14850,7 +15185,10 @@
       (Array.isArray(group?.conditions) ? group.conditions : []).some((condition) => {
         const normalizedCondition = normalizeAffixCondition(condition);
         return Boolean(normalizedCondition.craftId)
-          || (isRollCondition(normalizedCondition) && Boolean(AFFIX_ROLL_METRIC_SOURCES[normalizedCondition.metric]));
+          || (isRollCondition(normalizedCondition) && (
+            Boolean(AFFIX_ROLL_METRIC_SOURCES[normalizedCondition.metric])
+            || Boolean(CONDITION_GROUP_AFFIX_ROLL_METRICS[normalizedCondition.metric])
+          ));
       })
     ))
   );
@@ -15469,7 +15807,7 @@
     } else {
       throw new Error(
         `本地方案数据版本 ${Number.isFinite(storageVersion) ? storageVersion : '旧版'}`
-        + ' 与 2.23 全新词缀 ID 不兼容，请重新创建该方案。',
+        + ' 与 2.24 当前词缀 ID 不兼容，请重新创建该方案。',
       );
     }
     return assertCraftPlanAffixesRecognized(normalizeCraftPlan(expandedPlan));
@@ -15953,7 +16291,9 @@
 
   const refreshAdvancedBatchGardenCraftOptions = async (forceRefresh = false, preferredSelection = '') => {
     if (!state.ui.advancedBatchGardenCraftSelect) return;
-    await Promise.all(GARDEN_CRAFT_CATEGORY_OPTIONS.map((category) => ensureGardenCraftList(category.value, forceRefresh)));
+    for (const category of GARDEN_CRAFT_CATEGORY_OPTIONS) {
+      await ensureGardenCraftList(category.value, forceRefresh);
+    }
     const selectedValue = preferredSelection
       || state.ui.advancedBatchGardenCraftSelect.value
       || state.ui.advancedBatchGardenCraftSelect.dataset.pendingGardenCraftSelection
@@ -16151,7 +16491,9 @@
   const refreshEquipmentFilterBatchGardenCraftOptions = async (forceRefresh = false, preferredSelection = '') => {
     if (!state.ui.equipmentFilterBatchGardenCraftSelect) return;
     if (forceRefresh || !getAdvancedGardenCraftOptions().length) {
-      await Promise.all(GARDEN_CRAFT_CATEGORY_OPTIONS.map((category) => ensureGardenCraftList(category.value, forceRefresh)));
+      for (const category of GARDEN_CRAFT_CATEGORY_OPTIONS) {
+        await ensureGardenCraftList(category.value, forceRefresh);
+      }
     }
     const selectedValue = preferredSelection
       || state.ui.equipmentFilterBatchGardenCraftSelect.value
@@ -16455,7 +16797,7 @@
   };
 
   /**
-   * processBatchCurrencyTargets 对筛选出的装备并发使用批量通货。
+   * processBatchCurrencyTargets 对筛选出的装备串行使用批量通货。
    * @param {object} options 任务参数。
    */
   const processBatchCurrencyTargets = async (options) => {
@@ -16467,7 +16809,7 @@
     if (equipments.length < options.targetCount) {
       addLog(`只找到 ${equipments.length}/${options.targetCount} 件符合条件的装备。`, 'detail');
     }
-    addLog(`批量通货开始并发 ${BATCH_CURRENCY_CONCURRENCY} 个处理。`, 'compact');
+    addLog('批量通货开始串行处理。', 'compact');
     const qualityStoneTypes = [MODIFY_TYPES.whetstone, MODIFY_TYPES.armourScrap, MODIFY_TYPES.glassblowerBauble];
     const results = await runConcurrentTasks(equipments, BATCH_CURRENCY_CONCURRENCY, async (equipment) => {
       if (qualityStoneTypes.includes(options.batchStoneType)) {
@@ -17422,7 +17764,7 @@
         addLog(`暗金打造步骤 ${step.stepIndex + 1} 基底“${stepBaseLabel}”只找到 ${equipments.length}/${executionOptions.targetCount} 件。`, 'detail');
       }
       if (equipments.length) {
-        addLog(`暗金打造步骤 ${step.stepIndex + 1} 开始并发 ${AUTO_UNIQUE_CONCURRENCY} 件处理。`, 'compact');
+        addLog(`暗金打造步骤 ${step.stepIndex + 1} 开始串行处理。`, 'compact');
       }
       const craftedResults = equipments.length
         ? await runConcurrentTasks(equipments, AUTO_UNIQUE_CONCURRENCY, async (equipment) => (
@@ -17492,7 +17834,7 @@
   };
 
   /**
-   * processCraftSocketTargets 对筛选出的装备并发执行孔洞操作。
+   * processCraftSocketTargets 对筛选出的装备串行执行孔洞操作。
    * @param {object} options 任务参数。
    */
   const processCraftSocketTargets = async (options) => {
@@ -17504,7 +17846,7 @@
     if (equipments.length < options.targetCount) {
       addLog(`只找到 ${equipments.length}/${options.targetCount} 件符合条件的未腐化装备。`, 'detail');
     }
-    addLog(`孔洞操作开始并发 ${CRAFT_SOCKET_CONCURRENCY} 个处理。`, 'compact');
+    addLog('孔洞操作开始串行处理。', 'compact');
     const results = await runConcurrentTasks(equipments, CRAFT_SOCKET_CONCURRENCY, async (equipment) => {
       await processCraftLinkColor(equipment, options.targetColor);
       return { success: true };
@@ -18030,8 +18372,8 @@
   };
 
   /**
-   * processAutoUniqueTargets 并发执行经典打造里的自动暗金。
-   * 目标数量按成功做出暗金的数量计算；每个 worker 完成一件后立即领取下一件，避免固定批次被慢任务拖住。
+   * processAutoUniqueTargets 串行执行经典打造里的自动暗金。
+   * 目标数量按成功做出暗金的数量计算；完成一件后再领取下一件。
    * @param {object} options 任务参数。
    */
   const processAutoUniqueTargets = async (options) => {
@@ -18096,9 +18438,14 @@
         addTraceLog(`自动暗金 worker ${workerIndex + 1}/${workerCount} 已退出，处理 ${processedCount} 件。`);
       }
     };
-    const workerResults = await Promise.allSettled(
-      Array.from({ length: workerCount }, (_, workerIndex) => runWorker(workerIndex)),
-    );
+    const workerResults = [];
+    for (let workerIndex = 0; workerIndex < workerCount; workerIndex += 1) {
+      try {
+        workerResults.push({ status: 'fulfilled', value: await runWorker(workerIndex) });
+      } catch (error) {
+        workerResults.push({ status: 'rejected', reason: error });
+      }
+    }
     const failedWorkers = workerResults.filter((result) => (
       result.status === 'rejected' && !isRequestAbortError(result.reason)
     ));
@@ -19166,6 +19513,30 @@
   const renderSkillStoneOptions = (selectedIds = new Set()) => {
     const selectElement = state.ui.skillStoneSelect;
     if (!selectElement) return;
+    state.skillStones.sort((leftStone, rightStone) => {
+      const sourceOrder = (stone) => (stone?.source === 'backpack' ? 0 : 1);
+      const sourceDifference = sourceOrder(leftStone) - sourceOrder(rightStone);
+      if (sourceDifference) return sourceDifference;
+      const locationDifference = String(leftStone?.sourceLabel || '').localeCompare(
+        String(rightStone?.sourceLabel || ''),
+        'zh-CN',
+        { numeric: true },
+      );
+      if (locationDifference) return locationDifference;
+      const socketDifference = String(leftStone?.socketId || '').localeCompare(
+        String(rightStone?.socketId || ''),
+        'zh-CN',
+        { numeric: true },
+      );
+      if (socketDifference) return socketDifference;
+      const nameDifference = String(leftStone?.name || '').localeCompare(
+        String(rightStone?.name || ''),
+        'zh-CN',
+        { numeric: true },
+      );
+      if (nameDifference) return nameDifference;
+      return String(leftStone?.id || '').localeCompare(String(rightStone?.id || ''), 'zh-CN', { numeric: true });
+    });
     selectElement.replaceChildren();
     for (const stone of state.skillStones) {
       const optionElement = createElement('option', {
@@ -19642,6 +20013,20 @@
   const adjustPracticeSkillStonePositions = async () => {
     addLog('开始扫描智能练技能位置。', 'compact');
     const snapshot = await buildPracticeSkillStoneSnapshot();
+    const detailCandidates = Array.from(snapshot.stoneById.values()).filter((stone) => (
+      !stone.hasPracticeProgressData
+      || !stone.hasCategoryData
+      || getPracticeSkillStoneActiveState(stone) === null
+      || (isExceptionalSkillStone(stone) && !stone.hasQualityData)
+    ));
+    if (detailCandidates.length) {
+      addLog(`智能练技能按需串行补读 ${detailCandidates.length} 颗候选技能石详情。`, 'detail');
+      await runConcurrentTasks(
+        detailCandidates,
+        SKILL_STONE_DETAIL_CONCURRENCY,
+        (stone) => ensureSkillStoneDetailFields(stone, ['practice']),
+      );
+    }
     const removedDetails = [];
     const insertedDetails = [];
     const completedSockets = snapshot.socketRecords.filter((socketRecord) => {
@@ -19670,6 +20055,7 @@
           socketId: '',
           socketType: stone.category,
         });
+        syncSkillStoneLocalStateToCache(stone);
         removedDetails.push(detail);
         addLog(`已取下：${stone.name}（${socketRecord.equipmentName}）。`, 'detail');
         return { removed: true };
@@ -19707,7 +20093,7 @@
 
     let insertedCount = 0;
     if (assignments.length) {
-      addLog(`准备镶嵌练习技能石：${assignments.length} 颗，并发 ${SKILL_STONE_PRACTICE_CONCURRENCY} 个。`, 'info');
+      addLog(`准备串行镶嵌练习技能石：${assignments.length} 颗。`, 'info');
       const insertResults = await runConcurrentTasks(assignments, SKILL_STONE_PRACTICE_CONCURRENCY, async ({ socket, stone }) => {
         const payload = await insertSkillStoneToEquipment(socket.equipmentId, socket.socketId, stone.id);
         if (payload.success === false) throw new Error(payload.message || '镶嵌技能石失败');
@@ -19721,6 +20107,7 @@
           socketId: socket.socketId,
           socketType: socket.socketType,
         });
+        syncSkillStoneLocalStateToCache(stone);
         const activeState = getPracticeSkillStoneActiveState(stone);
         if (activeState === null) {
           throw new Error(`无法判断宝石是否主动技能：${stone.name || stone.id}`);
@@ -19730,11 +20117,13 @@
             const enablePayload = await setSkillStoneEnabled(stone.id, false);
             if (enablePayload.success === false) throw new Error(enablePayload.message || '关闭主动技能失败');
             disabledAfterInsert = true;
+            stone.enabled = false;
             addLog(`已关闭主动技能：${stone.name}。`, 'detail');
           } catch (error) {
             addLog(`关闭主动技能失败：${stone.name}，${error.message || error}。`, 'warn');
           }
         }
+        syncSkillStoneLocalStateToCache(stone);
         insertedDetails.push({
           stone: { ...stone },
           equipmentName: socket.equipmentName,
@@ -19750,30 +20139,21 @@
     } else if (freeSockets.length) {
       addLog(`当前有 ${freeSockets.length} 个可用练习孔，但背包里没有匹配颜色且未满的技能石。`, 'info');
     }
-    try {
-      addLog('智能练技能正在刷新装备状态，用于最终统计。', 'detail');
-      const refreshedEquippedStones = await fetchEquippedSkillStones();
-      const refreshedStoneById = new Map(
-        Array.from(snapshot.stoneById.values())
-          .filter((stone) => stone?.id && stone.source !== 'equipment')
-          .map((stone) => [stone.id, stone]),
-      );
-      for (const stone of refreshedEquippedStones) {
-        if (stone?.id) refreshedStoneById.set(stone.id, stone);
-      }
-      snapshot.stoneById = refreshedStoneById;
-      snapshot.socketRecords = state.practiceSkillStoneCache.socketRecords.map((socketRecord) => ({ ...socketRecord }));
-      snapshot.excludedEmptySockets = state.practiceSkillStoneCache.excludedEmptySockets || { active: [], special: [] };
-      snapshot.backpackStones = Array.from(refreshedStoneById.values()).filter((stone) => stone?.source === 'backpack');
-      snapshot.equippedStones = refreshedEquippedStones;
-    } catch (error) {
-      addLog(`智能练技能最终装备状态刷新失败：${error.message || error}。将使用本轮操作缓存统计。`, 'warn');
-      state.practiceSkillStoneCache = {
-        ...state.practiceSkillStoneCache,
-        loaded: true,
-        socketRecords: snapshot.socketRecords.map((socketRecord) => ({ ...socketRecord })),
-      };
-    }
+    snapshot.backpackStones = Array.from(snapshot.stoneById.values())
+      .filter((stone) => stone?.source === 'backpack');
+    snapshot.equippedStones = Array.from(snapshot.stoneById.values())
+      .filter((stone) => stone?.source === 'equipment');
+    state.practiceSkillStoneCache = {
+      ...state.practiceSkillStoneCache,
+      loaded: true,
+      socketRecords: snapshot.socketRecords.map((socketRecord) => ({ ...socketRecord })),
+    };
+    addLog(
+      removedCount > 0 || insertedCount > 0
+        ? '智能练技能已按本轮操作结果在本地重建背包、装备和孔位状态，未再次读取角色或技能石详情。'
+        : '智能练技能没有移动技能石，已直接复用已加载状态。',
+      'detail',
+    );
     mergePracticeSnapshotIntoSkillStoneState(snapshot.stoneById);
     addLog(`智能练技能完成：取下 ${removedCount} 颗，镶嵌 ${insertedCount} 颗。`, 'success');
     const managedEquippedStoneDetails = snapshot.socketRecords
@@ -19843,36 +20223,36 @@
 
   /**
    * applyGemcutterPrismBatch 对单颗技能石批量使用宝石匠的棱镜。
-   * 每批内部并发执行以提高速度；批次完成后统一汇总进度，避免日志刷屏到难以阅读。
+   * 批次内部也严格串行执行；批次完成后统一汇总进度，避免日志刷屏。
    * @param {object} stone 当前处理的技能石。
    * @param {number} startIndex 本批次从第几次棱镜开始。
    * @param {number} batchSize 本批次请求数量。
    * @returns {Promise<{successCount: number, payloads: Array<object>, error: Error|null}>} 本批次结果。
    */
   const applyGemcutterPrismBatch = async (stone, startIndex, batchSize) => {
-    const batchRequests = Array.from({ length: batchSize }, (_, offset) => {
+    const payloads = [];
+    let batchError = null;
+    for (let offset = 0; offset < batchSize; offset += 1) {
       const useIndex = startIndex + offset;
-      return modifySkillStone(stone.id, SKILL_STONE_MODIFY_TYPES.gemcutterPrism)
-        .then((payload) => {
-          if (payload.success === false) {
-            throw new Error(payload.message || '接口返回失败');
-          }
-          return { useIndex, payload };
-        });
-    });
-    const batchResults = await Promise.allSettled(batchRequests);
-    const failedResult = batchResults.find((result) => result.status === 'rejected');
-    const fulfilledResults = batchResults.filter((result) => result.status === 'fulfilled');
+      try {
+        const payload = await modifySkillStone(stone.id, SKILL_STONE_MODIFY_TYPES.gemcutterPrism);
+        if (payload.success === false) throw new Error(payload.message || '接口返回失败');
+        payloads.push(payload);
+      } catch (error) {
+        batchError = error;
+        break;
+      }
+    }
     return {
-      successCount: fulfilledResults.length,
-      payloads: fulfilledResults.map((result) => result.value.payload),
-      error: failedResult?.reason || null,
+      successCount: payloads.length,
+      payloads,
+      error: batchError,
     };
   };
 
   /**
    * applyGemcutterPrismsToSelectedStones 对选中的每颗技能石使用棱镜，直到品质补到 20。
-   * 单颗技能石按小批次并发执行，显著减少等待；每批都会写入进度日志。
+   * 单颗技能石严格串行执行，每次完成后写入进度日志。
    */
   const applyGemcutterPrismsToSelectedStones = async () => {
     const selectedIds = getSelectedSkillStoneIds();
@@ -19884,6 +20264,15 @@
     for (const [stoneIndex, stoneId] of selectedIds.entries()) {
       if (!state.isRunning) return;
       const stone = stoneById.get(stoneId) || { id: stoneId, name: stoneId, quality: 0 };
+      const detailReady = await ensureSkillStoneDetailFields(stone, ['quality', 'corrupted']);
+      if (!detailReady) {
+        addLog(`${stone.name} 无法确认品质或腐化状态，已跳过棱镜。`, 'warn');
+        continue;
+      }
+      if (stone.corrupted) {
+        addLog(`${stone.name} 已腐化，无法使用宝石匠的棱镜。`, 'warn');
+        continue;
+      }
       const initialQuality = Math.max(0, Math.min(GEMCUTTER_TARGET_QUALITY, Number.parseInt(stone.quality, 10) || 0));
       const totalUsesPerStone = Math.max(0, GEMCUTTER_TARGET_QUALITY - initialQuality);
       if (totalUsesPerStone <= 0) {
@@ -19900,15 +20289,22 @@
           for (const payload of batchResult.payloads) {
             if (!payload.data) continue;
             const updatedStone = payload.data.stone || payload.data.skillStone || payload.data;
-            Object.assign(stone, normalizeSkillStone({ ...stone, ...updatedStone }));
+            mergeSkillStoneDetail(stone, updatedStone);
           }
           if (batchResult.successCount && Number(stone.quality || 0) < initialQuality + successCount) {
             stone.quality = Math.min(GEMCUTTER_TARGET_QUALITY, initialQuality + successCount);
+          }
+          if (batchResult.successCount) {
+            stone.hasQualityData = true;
+            syncSkillStoneLocalStateToCache(stone);
           }
           addLog(`${stone.name} 棱镜进度：${successCount}/${totalUsesPerStone}，预计品质 ${Math.min(GEMCUTTER_TARGET_QUALITY, initialQuality + successCount)}%（本批 ${batchResult.successCount} 次）。`, 'info');
           if (batchResult.error) {
             addLog(`${stone.name} 棱镜进度停在 ${successCount}/${totalUsesPerStone}：${batchResult.error.message}`, 'error');
             break;
+          }
+          if (useIndex + batchSize <= totalUsesPerStone) {
+            await wait(Math.max(SKILL_STONE_WRITE_MIN_DELAY_MS, getSpeedDelay()));
           }
         } catch (error) {
           addLog(`${stone.name} 棱镜进度停在 ${successCount}/${totalUsesPerStone}：${error.message}`, 'error');
@@ -19934,7 +20330,7 @@
     const beforeLevel = Number(stone.level || 0);
     const updatedStone = getSkillStoneFromPayload(payload);
     if (updatedStone) {
-      Object.assign(stone, normalizeSkillStone({ ...stone, ...updatedStone }));
+      mergeSkillStoneDetail(stone, updatedStone);
     }
     const nextLevel = Number(stone.level || 0);
     if (!Number.isFinite(nextLevel) || nextLevel <= beforeLevel) {
@@ -19977,8 +20373,6 @@
       try {
         const payload = await upgradeSkillStone(stone.id);
         if (payload.success === false) {
-          const detail = await fetchSkillStoneDetail(stone.id);
-          if (detail) Object.assign(stone, normalizeSkillStone({ ...stone, ...detail }));
           if (!canAttemptSkillStoneUpgrade(stone)) {
             stopReason = Number(stone.level || 0) >= 20 ? '已满级' : '经验不足';
           } else {
@@ -19987,6 +20381,7 @@
           break;
         }
         applySuccessfulSkillStoneUpgradeLocally(stone, payload);
+        syncSkillStoneLocalStateToCache(stone);
         successCount += 1;
         await wait(getSpeedDelay());
       } catch (error) {
@@ -20042,8 +20437,16 @@
       .map((stoneId) => stoneById.get(stoneId))
       .filter((stone) => stone?.id);
     if (!stones.length) throw new Error('选中的技能石不在当前列表中，请重新加载技能石。');
-    const summary = { levelUp: 0, unchanged: 0, levelDown: 0, unable: 0 };
+    const selectedIdSet = new Set(selectedIds);
+    const summary = { levelUp: 0, unchanged: 0, levelDown: 0, unknown: 0, unable: 0 };
     const results = await runConcurrentTasks(stones, SKILL_STONE_VAAL_BATCH_SIZE, async (stone, stoneIndex) => {
+      if (!stone.hasCorruptedData) {
+        const detailReady = await ensureSkillStoneDetailFields(stone, ['corrupted']);
+        if (!detailReady) {
+          addLog(`${stone.name} 无法确认腐化状态，已跳过瓦尔宝珠。`, 'warn');
+          return { outcome: 'unable' };
+        }
+      }
       if (stone.corrupted) {
         addLog(`${stone.name} 已腐化，无法再次腐化。`, 'warn');
         return { outcome: 'unable' };
@@ -20057,11 +20460,18 @@
           return { outcome: 'unable' };
         }
         const updatedStone = getSkillStoneFromPayload(payload);
-        if (updatedStone) {
-          Object.assign(stone, normalizeSkillStone({ ...stone, ...updatedStone }));
-        } else {
-          const detail = await fetchSkillStoneDetail(stone.id);
-          if (detail) Object.assign(stone, normalizeSkillStone({ ...stone, ...detail }));
+        const hasUpdatedStone = updatedStone
+          && typeof updatedStone === 'object'
+          && Object.keys(updatedStone).length > 0;
+        if (hasUpdatedStone) {
+          mergeSkillStoneDetail(stone, updatedStone);
+        }
+        stone.corrupted = true;
+        stone.hasCorruptedData = true;
+        syncSkillStoneLocalStateToCache(stone);
+        if (!hasUpdatedStone) {
+          addLog(`${stone.name} 腐化完成：接口未返回新等级，已在本地标记为腐化，等级暂按 Lv.${beforeLevel || '?'} 显示。`, 'info');
+          return { outcome: 'unknown' };
         }
         const afterLevel = Number(stone.level || beforeLevel);
         if (afterLevel > beforeLevel) {
@@ -20083,8 +20493,9 @@
       const outcome = result?.outcome || (result?.error ? 'unable' : 'unable');
       if (Object.prototype.hasOwnProperty.call(summary, outcome)) summary[outcome] += 1;
     });
-    addLog(`技能石腐化完成：${summary.levelUp} 个等级 +1，${summary.unchanged} 个等级不变，${summary.levelDown} 个等级 -1，${summary.unable} 个无法腐化。`, 'compact');
-    await refreshSkillStoneList();
+    addLog(`技能石腐化完成：${summary.levelUp} 个等级 +1，${summary.unchanged} 个等级不变，${summary.levelDown} 个等级 -1，${summary.unknown} 个接口未返回新等级，${summary.unable} 个无法腐化。`, 'compact');
+    rerenderSkillStoneListAfterLocalUpdates(selectedIdSet);
+    addLog('技能石腐化完成：已按接口返回和本地动作结果更新列表，未执行全量技能石刷新。', 'compact');
   };
 
   /**
@@ -20113,8 +20524,19 @@
     if (payload.success === false) {
       throw new Error(payload.message || '丢弃技能石失败');
     }
+    const destroyedIdSet = new Set(selectedIds);
+    state.skillStones = state.skillStones.filter((stone) => !destroyedIdSet.has(stone.id));
+    for (const stoneId of destroyedIdSet) state.skillStoneDetailCache.delete(stoneId);
+    state.practiceSkillStoneCache = {
+      ...state.practiceSkillStoneCache,
+      socketRecords: (state.practiceSkillStoneCache?.socketRecords || []).map((socketRecord) => (
+        destroyedIdSet.has(socketRecord.stoneId)
+          ? { ...socketRecord, stoneId: '' }
+          : socketRecord
+      )),
+    };
     addLog(`已丢弃 ${selectedIds.length} 颗技能石。`, 'compact');
-    await refreshSkillStoneList();
+    rerenderSkillStoneListAfterLocalUpdates(new Set());
   };
 
   /**
@@ -20208,17 +20630,15 @@
     if (PAGE_MODULE_CACHE.equipment) return PAGE_MODULE_CACHE.equipment;
     PAGE_MODULE_CACHE.equipment = (async () => {
       const gameCoreUrl = findPageAssetUrl(/\/game-core-[^/]+\.js(?:\?|$)/, '/assets/game-core-CX6Yc2BQ.js');
-      const source = await fetch(gameCoreUrl, { cache: 'force-cache' }).then((response) => {
+      const source = await runSerializedRequest(() => fetch(gameCoreUrl, { cache: 'force-cache' }).then((response) => {
         if (!response.ok) throw new Error(`加载 game-core 失败：${response.status}`);
         return response.text();
-      });
+      }));
       const vueCoreUrl = extractModuleImportUrl(source, gameCoreUrl, 'vue-core-[^"]+\\.js', '/assets/vue-core-AUMxGMvO.js');
       const antdUrl = extractModuleImportUrl(source, gameCoreUrl, 'antd-all-[^"]+\\.js', '/assets/antd-all-BzjB6C9Q.js');
-      const [gameCoreModule, vueCoreModule, antdModule] = await Promise.all([
-        import(gameCoreUrl),
-        import(vueCoreUrl),
-        import(antdUrl),
-      ]);
+      const gameCoreModule = await runSerializedRequest(() => import(gameCoreUrl));
+      const vueCoreModule = await runSerializedRequest(() => import(vueCoreUrl));
+      const antdModule = await runSerializedRequest(() => import(antdUrl));
       // 打包器会在网页更新时重新分配单字母导出名（例如装备组件曾由 h 变为 g）。
       // Vue 组件自身的 __name/name 是稳定语义，不能继续依赖压缩后的导出键。
       const EquipmentComponent = Object.values(gameCoreModule).find((candidate) => (
@@ -20943,7 +21363,7 @@
       addLog('已取消筛选结果批量通货。', 'compact');
       return;
     }
-    addLog(`筛选结果批量通货开始：${equipments.length} 件，通货 ${stoneName}，并发 ${BATCH_CURRENCY_CONCURRENCY}。`, 'compact');
+    addLog(`筛选结果批量通货开始：${equipments.length} 件，通货 ${stoneName}，串行处理。`, 'compact');
     const qualityStoneTypes = [MODIFY_TYPES.whetstone, MODIFY_TYPES.armourScrap, MODIFY_TYPES.glassblowerBauble];
     const targetCount = equipments.length;
     const results = await runConcurrentTasks(equipments, BATCH_CURRENCY_CONCURRENCY, async (equipment) => {
@@ -21038,11 +21458,16 @@
     let remainingNonTierOneCount = pendingEquipments.length;
     for (let startIndex = 0; state.isRunning && startIndex < pendingEquipments.length; startIndex += FRACTURED_DESTROY_BATCH_SIZE) {
       const equipmentBatch = pendingEquipments.slice(startIndex, startIndex + FRACTURED_DESTROY_BATCH_SIZE);
-      const batchResults = await Promise.allSettled(equipmentBatch.map(async (equipment) => {
-        const payload = await destroyEquipment(equipment.id);
-        if (payload.success === false) throw new Error(payload.message || '丢弃失败');
-        return equipment;
-      }));
+      const batchResults = [];
+      for (const equipment of equipmentBatch) {
+        try {
+          const payload = await destroyEquipment(equipment.id);
+          if (payload.success === false) throw new Error(payload.message || '丢弃失败');
+          batchResults.push({ status: 'fulfilled', value: equipment });
+        } catch (error) {
+          batchResults.push({ status: 'rejected', reason: error });
+        }
+      }
       for (const [resultIndex, result] of batchResults.entries()) {
         const equipment = equipmentBatch[resultIndex];
         if (result.status === 'fulfilled') {
@@ -21190,7 +21615,7 @@
       return;
     }
 
-    addLog(`准备从 ${equipmentCount} 件储藏装备取下 ${socketStones.length} 颗技能石，并发 ${SKILL_STONE_PRACTICE_CONCURRENCY} 个。`, 'compact');
+    addLog(`准备从 ${equipmentCount} 件储藏装备串行取下 ${socketStones.length} 颗技能石。`, 'compact');
     let completedCount = 0;
     const results = await runConcurrentTasks(socketStones, SKILL_STONE_PRACTICE_CONCURRENCY, async (record) => {
       const payload = await removeSkillStoneFromEquipment(record.equipmentId, record.socketId);
@@ -24325,9 +24750,6 @@
     if (state.ui.continuousCraftIdField) {
       state.ui.continuousCraftIdField.hidden = !isCraftBenchAction;
     }
-    if (state.ui.continuousCraftRefreshButton) {
-      state.ui.continuousCraftRefreshButton.hidden = !isCraftBenchAction && !isGardenCraftAction;
-    }
     if (state.ui.continuousGardenCategoryField) {
       state.ui.continuousGardenCategoryField.hidden = !isGardenCraftAction;
     }
@@ -24637,6 +25059,22 @@
     renderContinuousCraftSteps();
     loadContinuousCraftStepForEditing();
     addLog('已套用“变为魔法 -> 改造石 -> 智能增幅 -> 判断条件 -> 富豪石 -> 判断条件(成功终止/失败重铸)”自定义打造预设。', 'compact');
+  };
+
+  /**
+   * applyDivineRollPresetToContinuousSteps 将当前条件组套用为神圣石洗 Roll 循环。
+   * 先检查现有 Roll；已满足时直接成功，未满足时使用一次神圣石并回到条件判断。
+   */
+  const applyDivineRollPresetToContinuousSteps = () => {
+    const groups = getAffixConditionGroups();
+    state.continuousCraftSteps = [
+      createContinuousCraftStep('conditionCheck', groups, 'jump', 'terminateSuccess', null, 1),
+      createContinuousCraftStep('divine', [createEmptyAffixConditionGroup()], 'jump', 'jump', 0, 0),
+    ];
+    state.activeContinuousStepIndex = 0;
+    renderContinuousCraftSteps();
+    loadContinuousCraftStepForEditing();
+    addLog('已套用“判断 Roll -> 未满足时使用神圣石 -> 返回判断；满足时成功终止”自定义打造预设。', 'compact');
   };
 
   /**
@@ -25586,6 +26024,13 @@
       state.ui.equipmentFilterBatchStoreCorruptedBaseInput,
     ].forEach((controlElement) => {
       controlElement.addEventListener('change', syncEquipmentFilterBatchStepEditor);
+      if (controlElement === state.ui.equipmentFilterBatchGardenCraftInput) {
+        controlElement.addEventListener('change', () => {
+          if (controlElement.checked && !getAdvancedGardenCraftOptions().length) {
+            scheduleEquipmentFilterBatchGardenCraftOptionsRefresh(false, '');
+          }
+        });
+      }
     });
      const resultBatchSection = createElement('div', {
        className: 'poe2-section poe2-wide',
@@ -25931,10 +26376,11 @@
             createLabeledControl(createHelpedLabel('自动化速度', '速度档位说明', [
               '只控制步骤间等待时间。',
               '不影响日志多少。',
-              '逐步：等待 1.5 秒。',
-              '普通：等待 0.5 秒。',
-              '快速：等待 0.05 秒。',
+              '逐步：等待 2.5 秒。',
+              '普通：等待 0.7 秒。',
+              '快速：等待 0.3 秒。',
               '立即：不额外等待。',
+              '立即可能频繁触发 HTTP 429；建议优先使用普通。',
             ]), state.ui.speedSelect),
             createLabeledControl(createHelpedLabel('日志等级', '日志等级说明', [
               '只控制显示多少信息。',
@@ -26105,6 +26551,9 @@
     '基底加成和催化剂会先还原再计算。',
     '固定值和机制词条不参与 Roll。',
     '平均 Roll 看整体；最低 Roll 看最差一条。',
+    '条件组内 Roll 只统计本组当前实际命中的词缀。',
+    '同一实际词缀被多条条件命中时只计算一次。',
+    '组内 Roll 条件本身也占本组 1 条命中。',
   ]);
 
   const createAffixItemLevelHelpTooltip = () => createHelpTooltip('词缀物品等级说明', [
@@ -26796,7 +27245,12 @@
     });
     state.ui.uniqueCraftNonUniqueActionSelect.addEventListener('change', syncUniqueCraftCurrentStepSummary);
     state.ui.uniqueCraftIncludeDroppedUniquesInput.addEventListener('change', syncUniqueCraftCurrentStepSummary);
-    state.ui.uniqueCraftTargetList.addEventListener('change', syncUniqueCraftCurrentStepSummary);
+    state.ui.uniqueCraftTargetList.addEventListener('change', (event) => {
+      syncUniqueCraftCurrentStepSummary();
+      if (event.target?.dataset?.role === 'enableGardenCraft' && event.target.checked && !getAdvancedGardenCraftOptions().length) {
+        scheduleUniqueCraftGardenCraftOptionsRefresh(getUniqueCraftPreferredGardenCraftSelection());
+      }
+    });
     state.ui.uniqueCraftTargetList.addEventListener('input', syncUniqueCraftCurrentStepSummary);
     state.ui.craftPlanNameInput = createElement('input', { className: 'poe2-input', placeholder: '自定义方案名称' });
     state.ui.craftPlanSelect = createSelect([], '');
@@ -27100,6 +27554,13 @@
           controlElement.dataset.pendingGardenCraftSelection = '';
         });
       }
+      if (controlElement === state.ui.advancedBatchGardenCraftInput) {
+        controlElement.addEventListener('change', () => {
+          if (controlElement.checked && !getAdvancedGardenCraftOptions().length) {
+            scheduleAdvancedBatchGardenCraftOptionsRefresh(false, '');
+          }
+        });
+      }
       if (controlElement === state.ui.advancedBatchKeywordInput) {
         controlElement.addEventListener('input', syncAdvancedBatchStepEditor);
       }
@@ -27223,16 +27684,7 @@
     const removeContinuousStepButton = createButton('删除步骤', removeContinuousCraftStep);
     const clearAllContinuousStepsButton = createButton('清除所有步骤', clearAllContinuousCraftSteps);
     const presetAltAugRegalButton = createButton('套用改造增幅富豪预设', applyAltAugRegalPresetToContinuousSteps);
-    state.ui.continuousCraftRefreshButton = createButton('刷新工艺列表', () => {
-      if (getActionFromContinuousActionControls() === 'gardenCraft') {
-        const preferredSelection = state.ui.advancedBatchGardenCraftSelect?.value
-          || state.ui.advancedBatchGardenCraftSelect?.dataset.pendingGardenCraftSelection
-          || '';
-        scheduleAdvancedBatchGardenCraftOptionsRefresh(true, preferredSelection);
-      } else {
-        scheduleContinuousCraftBenchOptionsRefresh(true);
-      }
-    });
+    const presetDivineRollButton = createButton('套用神圣洗 Roll 预设', applyDivineRollPresetToContinuousSteps);
     const startContinuousCraftButton = createButton('开始自定义打造', () => runCraftRequestTask('自定义打造', async () => {
       const options = createCustomCraftSnapshot();
       await ensureCraftBenchListForConditions(options);
@@ -27295,7 +27747,7 @@
                 startBatchButton,
                 createHelpTooltip('批量通货说明', [
                   '对筛选装备使用所选通货。',
-                  '最多 5 件并发。',
+                  '所有请求严格串行。',
                   '品质通货会持续用到不能继续。',
                   '达到经典动作上限会立刻停止整次任务。',
                 ]),
@@ -27420,7 +27872,7 @@
         }),
         createElement('div', {
           className: 'poe2-actions poe2-affix-actions',
-          children: [presetAltAugRegalButton, state.ui.continuousCraftRefreshButton],
+          children: [presetAltAugRegalButton, presetDivineRollButton],
         }),
       ],
     });
