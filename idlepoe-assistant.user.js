@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         idlepoe 助手测试服版 2.24
 // @namespace    https://idlepoe.com
-// @version      2.24.2.1
+// @version      2.24.2.2
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @author       天哪!是GPT大人
 // @match        *://poe-test.faith.wang/*
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.24.2.1';
+  const ASSISTANT_PATCH_VERSION = '2.24.2.2';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -2218,6 +2218,7 @@
     { value: 'belts', label: '腰带', mask: EQUIPMENT_TYPE_MASKS.belts },
     { value: 'amulets', label: '项链', mask: EQUIPMENT_TYPE_MASKS.amulets },
     { value: 'rings', label: '戒指', mask: EQUIPMENT_TYPE_MASKS.rings },
+    { value: 'jewels', label: '珠宝', mask: EQUIPMENT_TYPE_MASKS.jewels },
   ];
 
   const GARDEN_CRAFT_CATEGORY_OPTIONS = [
@@ -2240,6 +2241,11 @@
       label: '项链/戒指/腰带',
       mask: EQUIPMENT_TYPE_MASKS.amulets | EQUIPMENT_TYPE_MASKS.rings | EQUIPMENT_TYPE_MASKS.belts,
     },
+    {
+      value: 'jewels',
+      label: '珠宝',
+      mask: EQUIPMENT_TYPE_MASKS.jewels,
+    },
   ];
 
   const GARDEN_CRAFT_STARTUP_REQUESTS = [
@@ -2248,6 +2254,7 @@
     // 之前误用了 17179869184（力量头盔），导致整个护甲分类缓存缺少 8 条胸甲附魔。
     { categoryValue: 'armours', equipmentType: 134217728n },
     { categoryValue: 'jewelry', equipmentType: EQUIPMENT_TYPE_MASKS.amulets },
+    { categoryValue: 'jewels', equipmentType: EQUIPMENT_TYPE_MASKS.jewels },
   ];
 
   // FPOE 当前把这 8 条品质附魔的 equipmentTypes 错标成仅胸甲；游戏规则按通用护甲处理。
