@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         idlepoe 助手测试服版 2.24
 // @namespace    https://idlepoe.com
-// @version      2.24.1.1
+// @version      2.24.2.1
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @author       天哪!是GPT大人
 // @match        *://poe-test.faith.wang/*
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.24.1.1';
+  const ASSISTANT_PATCH_VERSION = '2.24.2.1';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -11764,7 +11764,14 @@
       method: 'POST',
       body: { equipmentId: equipment.id, craftId: craft.craftId },
     });
-    if (payload.success === false) throw new Error(payload.message || '花园工艺失败');
+    if (payload.success === false) {
+      const message = payload.message || '花园工艺失败';
+      const error = new Error(message);
+      if (/不适用于此装备类型|装备类型.*(?:不适用|不能使用)/.test(message)) {
+        error.uniqueCraftRejectedActionKey = `gardenCraft|${parseEquipmentTypeMask(equipmentTypeMask)}|${craft.key}`;
+      }
+      throw error;
+    }
     const updatedEquipment = payload.data?.equipment || payload.data;
     if (updatedEquipment) mergeEquipmentUpdate(equipment, updatedEquipment);
     const cost = craft.cost || payload.data?.cost || {};
@@ -17673,7 +17680,7 @@
     return { destroyed: false, stored: false };
   };
 
-  const applyUniqueCraftTargetProcessing = async (equipment, catalogItem, targetConfig) => {
+  const applyUniqueCraftTargetProcessing = async (equipment, catalogItem, targetConfig, runtimeContext = {}) => {
     let stageError = null;
     let stored = false;
     let destroyed = false;
@@ -17736,11 +17743,27 @@
         if (isEquipmentCorrupted(equipment)) {
           addStepLog(`${equipment.name} 已腐化，跳过花园附魔。`);
         } else {
-          await applyGardenCraftForEquipmentType(
-            equipment,
-            getUniqueCraftItemEquipmentTypeMask(catalogItem),
-            targetConfig.gardenCraftSelection,
-          );
+          const equipmentTypeMask = getUniqueCraftItemEquipmentTypeMask(catalogItem);
+          const rejectedActionKey = `gardenCraft|${parseEquipmentTypeMask(equipmentTypeMask)}|${targetConfig.gardenCraftSelection}`;
+          const previousRejection = runtimeContext.rejectedActionReasons?.get(rejectedActionKey);
+          if (previousRejection) {
+            const error = new Error(previousRejection);
+            error.uniqueCraftRejectedActionKey = rejectedActionKey;
+            error.suppressUniqueCraftStageWarning = true;
+            throw error;
+          }
+          try {
+            await applyGardenCraftForEquipmentType(
+              equipment,
+              equipmentTypeMask,
+              targetConfig.gardenCraftSelection,
+            );
+          } catch (error) {
+            if (error?.uniqueCraftRejectedActionKey && runtimeContext.rejectedActionReasons) {
+              runtimeContext.rejectedActionReasons.set(error.uniqueCraftRejectedActionKey, error.message || String(error));
+            }
+            throw error;
+          }
           if (!state.isRunning) return buildUniqueCraftTargetResult({ stopped: true });
         }
       }
@@ -17802,7 +17825,9 @@
       if (!state.isRunning || isRequestAbortError(error)) throw error;
       const message = error?.message || String(error);
       stageError = new Error(`${equipment.name} 目标后处理失败：${message}`);
-      addStepLog(stageError.message, 'warn');
+      if (!error?.suppressUniqueCraftStageWarning) {
+        addStepLog(`${stageError.message}；已跳过该装备的剩余处理。`, 'warn');
+      }
     }
     return buildUniqueCraftTargetResult();
   };
@@ -17906,7 +17931,7 @@
     return droppedEntries;
   };
 
-  const processUniqueCraftDroppedTargetEntry = async ({ equipment, catalogItem, targetConfig }) => {
+  const processUniqueCraftDroppedTargetEntry = async ({ equipment, catalogItem, targetConfig }, runtimeContext = {}) => {
     const corrupted = isEquipmentCorrupted(equipment);
     const processingConfig = corrupted
       ? {
@@ -17920,7 +17945,7 @@
       }
       : targetConfig;
     addStepLog(`${equipment.name} 并入掉落暗金：${catalogItem.name}${catalogItem.variantLabel ? `【${catalogItem.variantLabel}】` : ''}；${corrupted ? '已腐化，直接判断结果分类' : `处理：${formatUniqueCraftTargetActionSummary(processingConfig)}`}。`);
-    const processingResult = await applyUniqueCraftTargetProcessing(equipment, catalogItem, processingConfig);
+    const processingResult = await applyUniqueCraftTargetProcessing(equipment, catalogItem, processingConfig, runtimeContext);
     return {
       equipment,
       unique: Number(equipment.rarity) === RARITY_TYPES.unique,
@@ -17931,7 +17956,7 @@
     };
   };
 
-  const processUniqueCraftEquipment = async (equipment, step) => {
+  const processUniqueCraftEquipment = async (equipment, step, runtimeContext = {}) => {
     if (isEquipmentFractured(equipment)) {
       addStepLog(`${equipment.name} 是破裂装备，已跳过暗金打造。`);
       return { equipment, unique: Number(equipment.rarity) === RARITY_TYPES.unique, destroyed: false, stored: false, matchedTarget: false, skippedFractured: true };
@@ -17977,7 +18002,7 @@
       ...targetConfig,
       gainedCorruptedBase: Boolean(startResult.gainedCorruptedBase),
       startVaalAttempted: step.startMode === 'vaal' || step.startMode === 'vaalDestroyNonUnique',
-    });
+    }, runtimeContext);
     return {
       equipment,
       unique: Number(equipment.rarity) === RARITY_TYPES.unique,
@@ -18039,6 +18064,8 @@
     let totalRollSkippedCount = 0;
     let totalStoppedCount = 0;
     let totalDroppedMergedCount = 0;
+    let totalPostProcessSkippedCount = 0;
+    const runtimeContext = { rejectedActionReasons: new Map() };
     for (const step of runnableSteps) {
       if (!state.isRunning) break;
       state.currentPage = 1;
@@ -18050,7 +18077,7 @@
       for (const droppedEntry of droppedTargetEntries) {
         if (!state.isRunning) break;
         try {
-          droppedResults.push(await processUniqueCraftDroppedTargetEntry(droppedEntry));
+          droppedResults.push(await processUniqueCraftDroppedTargetEntry(droppedEntry, runtimeContext));
         } catch (error) {
           if (!state.isRunning || isRequestAbortError(error)) throw error;
           droppedResults.push({ equipment: droppedEntry.equipment, error });
@@ -18072,7 +18099,7 @@
       }
       const craftedResults = equipments.length
         ? await runConcurrentTasks(equipments, AUTO_UNIQUE_CONCURRENCY, async (equipment) => (
-          processUniqueCraftEquipment(equipment, step)
+          processUniqueCraftEquipment(equipment, step, runtimeContext)
         ))
         : [];
       const results = [...droppedResults, ...craftedResults];
@@ -18092,6 +18119,7 @@
       let stepRollSkippedCount = 0;
       let stepStoppedCount = 0;
       let stepDroppedMergedCount = 0;
+      let stepPostProcessSkippedCount = 0;
       for (const result of results) {
         if (!result || result.error) continue;
         stepProcessedCount += 1;
@@ -18117,6 +18145,10 @@
           stepRollSkippedCount += 1;
           totalRollSkippedCount += 1;
         }
+        if (result.stageError) {
+          stepPostProcessSkippedCount += 1;
+          totalPostProcessSkippedCount += 1;
+        }
         if (result.destroyed) {
           stepDestroyedCount += 1;
           totalDestroyedCount += 1;
@@ -18131,10 +18163,10 @@
         }
       }
       const stepSummaryPrefix = state.isRunning ? '结束' : '停止';
-      addMainLog(`暗金打造步骤 ${step.stepIndex + 1}/${runnableSteps.length} ${stepSummaryPrefix}：处理${stepProcessedCount}件，并入掉落暗金${stepDroppedMergedCount}件，暗金${[...stepUniqueCounts.values()].reduce((sum, count) => sum + count, 0)}件，目标命中${stepMatchedTargetCount}件，未配置${stepUnmatchedUniqueCount}件，Roll跳过${stepRollSkippedCount}件，停止${stepStoppedCount}件，丢弃${stepDestroyedCount}件，存储${stepStoredCount}件，异常${failedResults.length + stageFailedResults.length}件。`);
+      addMainLog(`暗金打造步骤 ${step.stepIndex + 1}/${runnableSteps.length} ${stepSummaryPrefix}：处理${stepProcessedCount}件，并入掉落暗金${stepDroppedMergedCount}件，暗金${[...stepUniqueCounts.values()].reduce((sum, count) => sum + count, 0)}件，目标命中${stepMatchedTargetCount}件，未配置${stepUnmatchedUniqueCount}件，Roll跳过${stepRollSkippedCount}件，后处理跳过${stepPostProcessSkippedCount}件，停止${stepStoppedCount}件，丢弃${stepDestroyedCount}件，存储${stepStoredCount}件，异常${failedResults.length + stageFailedResults.length}件。`);
       logAdvancedBatchUniqueSummary(stepUniqueCounts, `暗金打造步骤 ${step.stepIndex + 1} 基底“${stepBaseLabel}”暗金统计`);
     }
-    addLog(`暗金打造${state.isRunning ? '完成' : '停止汇总'}：处理${totalProcessedCount}件，并入掉落暗金${totalDroppedMergedCount}件，暗金${[...totalUniqueCounts.values()].reduce((sum, count) => sum + count, 0)}件，目标命中${totalMatchedTargetCount}件，未配置${totalUnmatchedUniqueCount}件，Roll跳过${totalRollSkippedCount}件，停止${totalStoppedCount}件，丢弃${totalDestroyedCount}件，存储${totalStoredCount}件，异常${totalFailedCount}件；${formatAdvancedBatchUniqueSummary(totalUniqueCounts)}。`, totalFailedCount || !state.isRunning ? 'warn' : 'success');
+    addLog(`暗金打造${state.isRunning ? '完成' : '停止汇总'}：处理${totalProcessedCount}件，并入掉落暗金${totalDroppedMergedCount}件，暗金${[...totalUniqueCounts.values()].reduce((sum, count) => sum + count, 0)}件，目标命中${totalMatchedTargetCount}件，未配置${totalUnmatchedUniqueCount}件，Roll跳过${totalRollSkippedCount}件，后处理跳过${totalPostProcessSkippedCount}件，停止${totalStoppedCount}件，丢弃${totalDestroyedCount}件，存储${totalStoredCount}件，异常${totalFailedCount}件；${formatAdvancedBatchUniqueSummary(totalUniqueCounts)}。`, totalFailedCount || !state.isRunning ? 'warn' : 'success');
   };
 
   /**
