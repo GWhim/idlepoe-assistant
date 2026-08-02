@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         idlepoe 助手测试服版 2.24
 // @namespace    https://idlepoe.com
-// @version      2.24.2.3
+// @version      2.24.2.4
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @author       天哪!是GPT大人
 // @match        *://poe-test.faith.wang/*
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.24.2.3';
+  const ASSISTANT_PATCH_VERSION = '2.24.2.4';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -2254,7 +2254,6 @@
     // 之前误用了 17179869184（力量头盔），导致整个护甲分类缓存缺少 8 条胸甲附魔。
     { categoryValue: 'armours', equipmentType: 134217728n },
     { categoryValue: 'jewelry', equipmentType: EQUIPMENT_TYPE_MASKS.amulets },
-    { categoryValue: 'jewels', equipmentType: EQUIPMENT_TYPE_MASKS.jewels },
   ];
 
   // FPOE 当前把这 8 条品质附魔的 equipmentTypes 错标成仅胸甲；游戏规则按通用护甲处理。
@@ -11619,6 +11618,10 @@
       catalystFailureCount = 1;
       addLog(`启动加载催化剂失败，本次将保持不可用：${error.message}`, 'warn');
     }
+    if (!state.gardenCraft.byCategory.jewels?.length && state.gardenCraft.byCategory.jewelry?.length) {
+      state.gardenCraft.byCategory.jewels = state.gardenCraft.byCategory.jewelry;
+      state.gardenCraft.byEquipmentType[normalizeEquipmentTypeCacheKey(EQUIPMENT_TYPE_MASKS.jewels)] = state.gardenCraft.byCategory.jewelry;
+    }
     state.gardenCraft.startupInitialized = true;
     return {
       gardenRequestCount: GARDEN_CRAFT_STARTUP_REQUESTS.length,
@@ -11661,9 +11664,17 @@
     return getCatalystsByEquipmentType(equipmentTypeMask);
   };
 
-  const getGardenCraftOptionsByCategory = (categoryValue) => (
-    state.gardenCraft.byCategory[getGardenCraftCategory(categoryValue).value] || []
-  ).map((craft) => ({
+  const getGardenCraftCategoryList = (categoryValue) => {
+    const category = getGardenCraftCategory(categoryValue);
+    if (category.value === 'jewels') {
+      return state.gardenCraft.byCategory.jewels?.length
+        ? state.gardenCraft.byCategory.jewels
+        : (state.gardenCraft.byCategory.jewelry || []);
+    }
+    return state.gardenCraft.byCategory[category.value] || [];
+  };
+
+  const getGardenCraftOptionsByCategory = (categoryValue) => getGardenCraftCategoryList(categoryValue).map((craft) => ({
     value: craft.key,
     label: craft.label,
   }));
@@ -11680,6 +11691,7 @@
     const supportedMasks = Array.isArray(craft?.equipmentTypes)
       ? craft.equipmentTypes.map(parseEquipmentTypeMask).filter((value) => value > 0n)
       : [];
+    if ((mask & EQUIPMENT_TYPE_MASKS.jewels) !== 0n && craft?.kind !== 'enchantment') return true;
     return mask > 0n && (!supportedMasks.length || supportedMasks.some((value) => (mask & value) !== 0n));
   };
 
@@ -11687,7 +11699,7 @@
     const mask = parseEquipmentTypeMask(equipmentTypeMask);
     const category = GARDEN_CRAFT_CATEGORY_OPTIONS.find((item) => (mask & item.mask) !== 0n);
     let list = category
-      ? (state.gardenCraft.byCategory[category.value] || [])
+      ? getGardenCraftCategoryList(category.value)
         .filter((craft) => isGardenCraftApplicableToEquipmentType(craft, mask))
       : [];
     if (category?.value === 'weapons' && (mask & ~(4n | EQUIPMENT_TYPE_MASKS.bows)) === 0n) {
@@ -11704,7 +11716,7 @@
 
   const getGardenCraftByKey = (categoryValue, gardenCraftKey) => {
     const normalizedKey = String(gardenCraftKey || '');
-    return (state.gardenCraft.byCategory[getGardenCraftCategory(categoryValue).value] || [])
+    return getGardenCraftCategoryList(categoryValue)
       .find((craft) => craft.key === normalizedKey) || null;
   };
 
