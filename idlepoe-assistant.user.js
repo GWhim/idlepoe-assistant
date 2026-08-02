@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         idlepoe 助手测试服版 2.24
 // @namespace    https://idlepoe.com
-// @version      2.24.2.5
+// @version      2.24.2.6
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @author       天哪!是GPT大人
 // @match        *://poe-test.faith.wang/*
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.24.2.5';
+  const ASSISTANT_PATCH_VERSION = '2.24.2.6';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -11773,10 +11773,19 @@
   };
 
   const applyGardenCraftForEquipmentType = async (equipment, equipmentTypeMask, gardenCraftKey) => {
+    const normalizedGardenCraftKey = String(gardenCraftKey || '').trim();
+    if (!normalizedGardenCraftKey) throw new Error('请先选择适用于该装备的花园工艺。');
     await ensureGardenCraftListForEquipmentType(equipmentTypeMask);
+    const parsedSelection = normalizedGardenCraftKey.includes('|')
+      ? parseGardenCraftSelectionValue(normalizedGardenCraftKey)
+      : { gardenCraftKey: normalizedGardenCraftKey };
+    const craftId = String(parsedSelection.gardenCraftKey || normalizedGardenCraftKey).trim();
+    if (!craftId) throw new Error('请先选择适用于该装备的花园工艺。');
     const craft = getGardenCraftsByEquipmentType(equipmentTypeMask)
-      .find((item) => item.key === String(gardenCraftKey || '')) || null;
-    if (!craft) throw new Error('请先选择适用于该装备的花园工艺。');
+      .find((item) => item.key === normalizedGardenCraftKey || item.key === craftId)
+      || findLoadedGardenCraftByKey(normalizedGardenCraftKey)
+      || findLoadedGardenCraftByKey(craftId)
+      || { key: normalizedGardenCraftKey, craftId, label: craftId };
     recordStepExecution('花园工艺');
     addMainLog(`${equipment.name} 使用花园工艺：${craft.label}。`);
     const payload = await requestJson(config.endpoints.gardenApply, {
