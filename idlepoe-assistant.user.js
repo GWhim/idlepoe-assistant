@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         idlepoe 助手测试服版 2.24
 // @namespace    https://idlepoe.com
-// @version      2.24.2.2
+// @version      2.24.2.3
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @author       天哪!是GPT大人
 // @match        *://poe-test.faith.wang/*
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.24.2.2';
+  const ASSISTANT_PATCH_VERSION = '2.24.2.3';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -17434,7 +17434,7 @@
       actions.push(socketModes.length ? `孔洞(${socketModes.join('/')})` : '孔洞');
     }
     if (targetConfig.enableQuality) actions.push('品质');
-    if (targetConfig.enableGardenCraft) actions.push('花园附魔');
+    if (targetConfig.enableGardenCraft) actions.push('花园工艺');
     if (targetConfig.enableCatalyst) actions.push('催化剂');
     if (targetConfig.enableVaal) actions.push('瓦尔');
     actions.push(...getUniqueCraftResultRuleSummaryParts(targetConfig));
@@ -17491,15 +17491,15 @@
         if (targetConfig?.enableGardenCraft) {
           const gardenCraftKey = String(targetConfig.gardenCraftSelection || '').trim();
           if (!gardenCraftKey) {
-            throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已勾选花园附魔，请先选择具体附魔。`);
+            throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已勾选花园工艺，请先选择具体工艺。`);
           }
           const selectionKey = `${targetEquipmentTypeMask}|${gardenCraftKey}`;
           if (!checkedGardenSelections.has(selectionKey)) {
             await ensureGardenCraftListForEquipmentType(targetEquipmentTypeMask);
-            const craft = getGardenCraftsByEquipmentType(targetEquipmentTypeMask, true)
+            const craft = getGardenCraftsByEquipmentType(targetEquipmentTypeMask)
               .find((itemCraft) => itemCraft.key === gardenCraftKey);
             if (!craft) {
-              throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已选择的花园附魔已失效或不适用于该装备，请重新选择。`);
+              throw new Error(`暗金打造步骤 ${step.stepIndex + 1} 的 ${item.name} 已选择的花园工艺已失效或不适用于该装备，请重新选择。`);
             }
             checkedGardenSelections.add(selectionKey);
           }
@@ -17748,7 +17748,7 @@
       }
       if (!rollSkippedRest && targetConfig.enableGardenCraft && state.isRunning) {
         if (isEquipmentCorrupted(equipment)) {
-          addStepLog(`${equipment.name} 已腐化，跳过花园附魔。`);
+          addStepLog(`${equipment.name} 已腐化，跳过花园工艺。`);
         } else {
           const equipmentTypeMask = getUniqueCraftItemEquipmentTypeMask(catalogItem);
           const rejectedActionKey = `gardenCraft|${parseEquipmentTypeMask(equipmentTypeMask)}|${targetConfig.gardenCraftSelection}`;
@@ -23936,9 +23936,9 @@
     const selectElement = createSelect([], '');
     const equipmentTypeMask = getUniqueCraftItemEquipmentTypeMask(item);
     const cacheLoaded = !isGardenOrCatalystEquipmentType(equipmentTypeMask) || state.gardenCraft.startupInitialized;
-    const options = getGardenCraftsByEquipmentType(equipmentTypeMask, true)
+    const options = getGardenCraftsByEquipmentType(equipmentTypeMask)
       .map((craft) => ({ value: craft.key, label: craft.label }));
-    setSelectOptions(selectElement, options, options.length ? '选择花园附魔' : (cacheLoaded ? '无可用花园附魔' : '花园附魔加载中'));
+    setSelectOptions(selectElement, options, options.length ? '选择花园工艺' : (cacheLoaded ? '无可用花园工艺' : '花园工艺加载中'));
     const selectedValue = String(pendingSelection || '');
     selectElement.value = options.some((option) => String(option.value) === selectedValue) ? selectedValue : '';
     return selectElement;
@@ -24146,14 +24146,14 @@
     const supportsGardenOrCatalyst = isGardenOrCatalystEquipmentType(targetEquipmentTypeMask);
     const gardenOptionsLoaded = !supportsGardenOrCatalyst || state.gardenCraft.startupInitialized;
     const catalystOptionsLoaded = !supportsGardenOrCatalyst || state.gardenCraft.startupInitialized;
-    const hasGardenEnchantments = getGardenCraftsByEquipmentType(targetEquipmentTypeMask, true).length > 0;
+    const hasGardenCrafts = getGardenCraftsByEquipmentType(targetEquipmentTypeMask).length > 0;
     const hasCatalysts = getCatalystsByEquipmentType(targetEquipmentTypeMask).length > 0;
     const hideQualityForCatalyst = catalystOptionsLoaded && hasCatalysts;
     [socketInput, socketFullSocketsSelect, socketFullLinksSelect, vaalInput].forEach((inputElement) => setUniqueCraftUnavailableControl(inputElement, isVaalStartMode));
     setUniqueCraftUnavailableControl(qualityInput, isVaalStartMode || hideQualityForCatalyst);
-    setUniqueCraftUnavailableControl(gardenInput, isVaalStartMode || (gardenOptionsLoaded && !hasGardenEnchantments));
+    setUniqueCraftUnavailableControl(gardenInput, isVaalStartMode || (gardenOptionsLoaded && !hasGardenCrafts));
     setUniqueCraftUnavailableControl(catalystInput, isVaalStartMode || (catalystOptionsLoaded && !hasCatalysts));
-    gardenSelect.disabled = isVaalStartMode || (gardenOptionsLoaded && !hasGardenEnchantments);
+    gardenSelect.disabled = isVaalStartMode || (gardenOptionsLoaded && !hasGardenCrafts);
     catalystSelect.disabled = isVaalStartMode || (catalystOptionsLoaded && !hasCatalysts);
     const storeRuleSelect = createSelect(UNIQUE_CRAFT_STORE_RULE_OPTIONS, targetConfig.storeRule);
     storeRuleSelect.dataset.role = 'storeRule';
@@ -24192,9 +24192,9 @@
       ));
       nextUniqueCraftActionNumber += 1;
     }
-    if (!gardenOptionsLoaded || hasGardenEnchantments) {
+    if (!gardenOptionsLoaded || hasGardenCrafts) {
       uniqueCraftActionRows.push(createUniqueCraftOptionRow(
-        `${nextUniqueCraftActionNumber}. 花园附魔`,
+        `${nextUniqueCraftActionNumber}. 花园工艺`,
         gardenInput,
         gardenSelect,
       ));
@@ -28328,8 +28328,8 @@
             createHelpTooltip('暗金打造说明', [
               '按步骤依次打造目标基底。',
               '命中暗金后，按对应暗金卡片里的配置处理。',
-              '可配置孔洞、品质、花园附魔、催化剂、Roll、瓦尔和最终去向。',
-              '花园附魔与催化剂按每件暗金的实际装备类型分别显示。',
+              '可配置孔洞、品质、花园工艺、催化剂、Roll、瓦尔和最终去向。',
+              '花园工艺与催化剂按每件暗金的实际装备类型分别显示。',
               '暗金不能重铸；非暗金结果按“非暗金处理”处理。',
               'Roll 填装备上看到的实际数值，不填百分比。',
               '多个 Roll 条件默认全部满足。',
