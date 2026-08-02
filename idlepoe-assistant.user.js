@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         idlepoe 助手测试服版 2.24
 // @namespace    https://idlepoe.com
-// @version      2.24.2.4
+// @version      2.24.2.5
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @author       天哪!是GPT大人
 // @match        *://poe-test.faith.wang/*
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.24.2.4';
+  const ASSISTANT_PATCH_VERSION = '2.24.2.5';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -19014,6 +19014,12 @@
     }
   };
 
+  const getContinuousGardenCraftEquipmentTypeMask = (equipment, step) => {
+    const equipmentMask = parseEquipmentTypeMask(getEquipmentTypeValueForFilter(equipment));
+    if (equipmentMask > 0n) return equipmentMask;
+    return getGardenCraftCategory(step?.gardenCraftCategory).mask || getCraftTargetEquipmentTypeMask(state.ui.equipmentTypeSelect?.value);
+  };
+
   /**
    * executeContinuousCraftStep 执行连续打造中的单个步骤。
    * 返回 false 表示本轮连续打造失败，外层会重新从第一步开始尝试。
@@ -19078,8 +19084,7 @@
     if (normalizedStep.action === 'gardenCraft') {
       await applyGardenCraftForEquipmentType(
         equipment,
-        parseEquipmentTypeMask(getEquipmentTypeValueForFilter(equipment))
-          || getCraftTargetEquipmentTypeMask(state.ui.equipmentTypeSelect?.value),
+        getContinuousGardenCraftEquipmentTypeMask(equipment, normalizedStep),
         normalizedStep.gardenCraftKey,
       );
       addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 花园工艺完成。`);
