@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         idlepoe 助手测试服版 2.24
 // @namespace    https://idlepoe.com
-// @version      2.24.2.6
+// @version      2.24.5.1
 // @description  测试服装备改造助手：批量通货、打孔链接、洗色、词缀筛选、通货邮件。
 // @author       天哪!是GPT大人
 // @match        *://poe-test.faith.wang/*
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  const ASSISTANT_PATCH_VERSION = '2.24.2.6';
+  const ASSISTANT_PATCH_VERSION = '2.24.5.1';
 
   const SKILL_TREE_IMPORT_SESSION_KEY = 'poeAssistantV2.skillTreePendingImport';
   const SKILL_TREE_IMPORT_STATUS_SESSION_KEY = 'poeAssistantV2.skillTreeImportStatus';
@@ -1972,8 +1972,14 @@
    */
   const CONTINUOUS_CRAFT_ACTIONS = {
     conditionCheck: {
-      label: '条件判断',
-      currencyLabel: '条件判断',
+      label: '单条件判断',
+      currencyLabel: '单条件判断',
+      limits: { prefix: 3, suffix: 3, total: 6 },
+      requiresConditions: true,
+    },
+    multiConditionCheck: {
+      label: '多条件判断',
+      currencyLabel: '多条件判断',
       limits: { prefix: 3, suffix: 3, total: 6 },
       requiresConditions: true,
     },
@@ -2144,6 +2150,10 @@
       'smartExalted',
       'smartCraftBench',
     ],
+    condition: [
+      'conditionCheck',
+      'multiConditionCheck',
+    ],
   };
 
   const EQUIPMENT_TYPE_MASKS = {
@@ -2247,6 +2257,18 @@
       mask: EQUIPMENT_TYPE_MASKS.jewels,
     },
   ];
+
+  // 自定义打造按工艺用途分类；装备部位分类仍只用于启动缓存和实际适用性判断。
+  const CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS = [
+    { value: 'enchantment', label: '附魔' },
+    { value: 'conversion', label: '转换' },
+    { value: 'reforge', label: '重铸' },
+    { value: 'other', label: '其他' },
+  ];
+
+  const LEGACY_GARDEN_CRAFT_CATEGORY_VALUES = new Set(
+    GARDEN_CRAFT_CATEGORY_OPTIONS.map((option) => option.value),
+  );
 
   const GARDEN_CRAFT_STARTUP_REQUESTS = [
     { categoryValue: 'weapons', equipmentType: 1n },
@@ -7240,6 +7262,7 @@
     'fracturing',
     'chance',
     'catalyst',
+    'multiConditionCheck',
   ]);
 
   const SHARE_STEP_HANDLING_ENUM = createShareEnum([
@@ -7301,7 +7324,11 @@
   ]);
 
   const SHARE_CRAFT_CATEGORY_ENUM = createShareEnum(CRAFT_BENCH_CATEGORY_OPTIONS.map((option) => option.value));
-  const SHARE_GARDEN_CRAFT_CATEGORY_ENUM = createShareEnum(GARDEN_CRAFT_CATEGORY_OPTIONS.map((option) => option.value));
+  // 前三个值是 2.24 之前分享码中的武器/护甲/首饰分类，编号不可改变。
+  const SHARE_GARDEN_CRAFT_CATEGORY_ENUM = createShareEnum([
+    ...GARDEN_CRAFT_CATEGORY_OPTIONS.map((option) => option.value),
+    ...CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS.map((option) => option.value),
+  ]);
 
   const encodeShareEnumValue = (value, enumConfig) => enumConfig.toId[value] || value;
   const decodeShareEnumValue = (value, enumConfig, fallback = value) => (
@@ -7429,6 +7456,8 @@
     themeMode: Object.values(THEME_MODES).includes(settings.themeMode) ? settings.themeMode : THEME_MODES.auto,
     logMode: normalizeLogMode(settings.logMode || 'main'),
     minimizePausesAutomation: settings.minimizePausesAutomation === true || settings.minimizePausesAutomation === 'true',
+    showAffixWeights: settings.showAffixWeights !== false && settings.showAffixWeights !== 'false',
+    showAffixTypes: settings.showAffixTypes === true || settings.showAffixTypes === 'true',
     stepActionSafetyLimit: clampPositiveInteger(settings.stepActionSafetyLimit, 500, 1, 100000),
     customCraftStepSafetyLimit: clampPositiveInteger(settings.customCraftStepSafetyLimit, 300, 1, 100000),
     customCraftCurrencyLimit: clampPositiveInteger(settings.customCraftCurrencyLimit, 10000, 1, 1000000),
@@ -7445,6 +7474,8 @@
       themeMode: state.themeMode,
       logMode: state.logMode,
       minimizePausesAutomation: state.minimizePausesAutomation,
+      showAffixWeights: state.showAffixWeights,
+      showAffixTypes: state.showAffixTypes,
       stepActionSafetyLimit: state.stepActionSafetyLimit,
       customCraftStepSafetyLimit: state.customCraftStepSafetyLimit,
       customCraftCurrencyLimit: state.customCraftCurrencyLimit,
@@ -7519,6 +7550,9 @@
     refreshEquipmentAfterCraft: false,
     /** minimizePausesAutomation 表示收起面板时是否自动停止当前自动化任务。 */
     minimizePausesAutomation: assistantSettings.minimizePausesAutomation,
+    /** showAffixWeights/showAffixTypes 控制词缀选择器的附属信息显示。 */
+    showAffixWeights: assistantSettings.showAffixWeights,
+    showAffixTypes: assistantSettings.showAffixTypes,
     /** themeMode 表示助手 UI 主题模式，默认跟随网页 localStorage.theme。 */
     themeMode: assistantSettings.themeMode,
     /** panelPosition 保存主面板拖拽位置。 */
@@ -7592,14 +7626,6 @@
     fracturedEquipments: [],
     /** equipmentFilterResults 保存最近一次只读筛选命中的装备列表。 */
     equipmentFilterResults: [],
-    /** craftAdvancedFilterConditionGroups 保存“打造装备”公共高级筛选的词缀条件组。 */
-    craftAdvancedFilterConditionGroups: [],
-    /** craftLockedEquipmentResults 保存公共筛选扫描后锁定的装备快照。 */
-    craftLockedEquipmentResults: [],
-    /** craftAdvancedFilterLocked 区分“尚未扫描”和“已扫描但结果为空”。 */
-    craftAdvancedFilterLocked: false,
-    /** craftAdvancedFilterRevision 防止扫描期间修改条件后锁入过期结果。 */
-    craftAdvancedFilterRevision: 0,
     /** battleAnalysis 保存轻量战斗分析的连接状态和实时统计。 */
     battleAnalysis: {
       isConnected: false,
@@ -11497,6 +11523,22 @@
     || GARDEN_CRAFT_CATEGORY_OPTIONS[0]
   );
 
+  const getCustomGardenCraftCategory = (categoryValue) => (
+    CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS.find((option) => option.value === categoryValue)
+    || CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS[0]
+  );
+
+  const getGardenCraftSemanticCategoryValue = (craft) => {
+    const kind = String(craft?.kind || '').trim();
+    const craftId = String(craft?.craftId || craft?.key || '').trim();
+    const label = String(craft?.label || craft?.name || '').trim();
+    if (kind === 'enchantment' || (!kind && /Enchant$/i.test(craftId))) return 'enchantment';
+    if (['resistanceSwap', 'damageSwap'].includes(kind)
+      || (!kind && /^Change.+(?:Resist|Damage)$/i.test(craftId))) return 'conversion';
+    if (kind === 'reforge' || /^重铸/.test(label) || (!kind && /^Reforge/i.test(craftId))) return 'reforge';
+    return 'other';
+  };
+
   const CATALYST_EFFECT_LABELS = {
     24: '元素伤害',
     25: '施法',
@@ -11678,6 +11720,22 @@
     value: craft.key,
     label: craft.label,
   }));
+
+  const getLoadedGardenCrafts = () => {
+    const craftsByKey = new Map();
+    for (const craft of Object.values(state.gardenCraft.byEquipmentType).flat()) {
+      if (craft?.key && !craftsByKey.has(craft.key)) craftsByKey.set(craft.key, craft);
+    }
+    return [...craftsByKey.values()];
+  };
+
+  const getCustomGardenCraftOptionsByCategory = (categoryValue) => {
+    const normalizedCategoryValue = getCustomGardenCraftCategory(categoryValue).value;
+    return getLoadedGardenCrafts()
+      .filter((craft) => getGardenCraftSemanticCategoryValue(craft) === normalizedCategoryValue)
+      .sort((left, right) => left.label.localeCompare(right.label) || left.key.localeCompare(right.key))
+      .map((craft) => ({ value: craft.key, label: craft.label }));
+  };
 
   const getCatalystOptionsByCategory = (categoryValue = 'jewelry') => (
     state.catalyst.byCategory[getGardenCraftCategory(categoryValue).value] || []
@@ -12729,7 +12787,6 @@
     keyword,
     rarity,
     page,
-    pageSize = config.pageSize,
     useStorage = state.useStorage,
     excludeCorrupted = false,
     excludeFractured = false,
@@ -12740,7 +12797,9 @@
   }) => {
     const searchParams = new URLSearchParams({
       keyword: keyword || '',
-      pageSize: String(pageSize),
+      // 当前背包接口固定每页返回 30 件，即使传入更大的 pageSize 也不会改变。
+      // 分页请求和 hasMore 必须使用同一实际页容量，否则会提前停止扫描。
+      pageSize: String(config.pageSize),
       _: String(Date.now()),
     });
     if (rarity !== RARITY_TYPES.any && rarity !== '' && rarity !== undefined && rarity !== null) {
@@ -12764,7 +12823,7 @@
         !excludeRarities.includes(Number(getEquipmentRarityValueForFilter(item) ?? RARITY_TYPES.normal))
       )).map((item) => ({ ...item, assistantSourceLocation: item.assistantSourceLocation || sourceLocation })),
       total: Number(data.total || 0),
-      hasMore: page * pageSize < Number(data.total || 0),
+      hasMore: page * config.pageSize < Number(data.total || 0),
     };
   };
 
@@ -12812,35 +12871,6 @@
     return equipmentList.map(normalizeEquipment).filter((equipment) => equipment.id);
   };
 
-  const isLockedEquipmentKeywordMatched = (equipment, keyword) => {
-    const expectedKeyword = normalizeUniqueItemLookupText(keyword);
-    if (!expectedKeyword) return true;
-    return normalizeUniqueItemLookupText([
-      equipment?.name,
-      equipment?.baseName,
-      equipment?.baseType,
-    ].filter(Boolean).join(' ')).includes(expectedKeyword);
-  };
-
-  const isLockedEquipmentQueryMatched = (equipment, query = {}) => {
-    if (!equipment?.id || state.processedEquipmentIds.has(equipment.id)) return false;
-    if (!isLockedEquipmentKeywordMatched(equipment, query.keyword)) return false;
-    if (query.rarity !== RARITY_TYPES.any && query.rarity !== '' && query.rarity !== undefined && query.rarity !== null
-        && Number(getEquipmentRarityValueForFilter(equipment)) !== Number(query.rarity)) return false;
-    if (query.excludeCorrupted && isEquipmentCorrupted(equipment)) return false;
-    if (query.excludeFractured && isEquipmentFractured(equipment)) return false;
-    if (!isEquipmentExactBaseName(equipment, query.exactBaseName)) return false;
-    if (!isEquipmentTypeMaskMatched(equipment, query.exactEquipmentTypeMask)) return false;
-    if ((query.excludeRarities || []).includes(Number(getEquipmentRarityValueForFilter(equipment) ?? RARITY_TYPES.normal))) return false;
-    return true;
-  };
-
-  const getLockedEquipmentCandidates = (query = {}) => (
-    Array.isArray(query.lockedEquipments)
-      ? query.lockedEquipments.filter((equipment) => isLockedEquipmentQueryMatched(equipment, query))
-      : null
-  );
-
   /**
    * getNextEquipment 扫描分页并返回下一件未处理装备。
    * @param {object} query 查询条件。
@@ -12849,13 +12879,6 @@
    * @returns {Promise<object|null>} 找到的装备；找不到时返回 null。
    */
   const getNextEquipment = async (query) => {
-    const lockedCandidates = getLockedEquipmentCandidates(query);
-    if (lockedCandidates) {
-      const nextItem = lockedCandidates[0] || null;
-      if (!nextItem) return null;
-      state.processedEquipmentIds.add(nextItem.id);
-      return normalizeEquipment({ ...nextItem });
-    }
     let scannedPages = 0;
     while (state.isRunning && scannedPages < config.maxPagesPerRound) {
       const pageResult = await fetchBackpackPage({ ...query, page: state.currentPage });
@@ -12886,15 +12909,6 @@
     const equipments = [];
     let scannedPages = 0;
     const targetLimit = Math.max(1, Number(limit) || 1);
-    const lockedCandidates = getLockedEquipmentCandidates(query);
-    if (lockedCandidates) {
-      for (const item of lockedCandidates.slice(0, targetLimit)) {
-        state.processedEquipmentIds.add(item.id);
-        equipments.push(normalizeEquipment({ ...item }));
-      }
-      if (typeof onProgress === 'function' && equipments.length) onProgress(equipments.length);
-      return equipments;
-    }
     while (state.isRunning && equipments.length < targetLimit && scannedPages < config.maxPagesPerRound) {
       const pageResult = await fetchBackpackPage({ ...query, page: state.currentPage });
       const remainingCount = targetLimit - equipments.length;
@@ -13143,6 +13157,15 @@
     raw: equipment,
   });
 
+  const hasEquipmentLockedAffix = (equipment) => [
+    equipment?.affixes,
+    equipment?.raw?.affixes,
+    equipment?.data?.affixes,
+    equipment?.raw?.data?.affixes,
+  ].some((affixes) => Array.isArray(affixes) && affixes.some((affix) => Boolean(
+    affix?.isLocked || affix?.locked || affix?.fractured || affix?.isFractured,
+  )));
+
   const isEquipmentFractured = (equipment) => Boolean(
     equipment?.isFractured ||
     equipment?.fractured ||
@@ -13151,7 +13174,8 @@
     equipment?.data?.isFractured ||
     equipment?.data?.fractured ||
     equipment?.raw?.data?.isFractured ||
-    equipment?.raw?.data?.fractured
+    equipment?.raw?.data?.fractured ||
+    hasEquipmentLockedAffix(equipment)
   );
 
   const hasEquipmentSnapshotField = (equipment, fieldName) => Boolean(
@@ -13713,7 +13737,7 @@
    * createEmptyAffixConditionGroup 创建空条件组；每组独立维护自己的命中数量。
    * @returns {{conditions: Array<object>, minRequired: number}} 可写入 state 的空条件组。
    */
-  const createEmptyAffixConditionGroup = () => ({ conditions: [], minRequired: 1 });
+  const createEmptyAffixConditionGroup = () => ({ conditions: [], minRequired: 1, nextStepIndex: null });
 
   const expandLegacyCorruptedBaseConditionTiers = (condition) => {
     if (!isCorruptedBaseCondition(condition) || condition.corruptedMagicTier || !condition.corruptedMagicId) {
@@ -13733,7 +13757,7 @@
   /**
    * normalizeAffixConditionGroup 兼容旧数组组和新版对象组，统一为带本组命中数的条件组。
    * @param {Array|object} group 原始条件组。
-   * @returns {{conditions: Array<object>, minRequired: number}} 标准条件组。
+   * @returns {{conditions: Array<object>, minRequired: number, nextStepIndex: number|null}} 标准条件组。
    */
   const normalizeAffixConditionGroup = (group) => {
     const rawConditions = Array.isArray(group) ? group : group?.conditions;
@@ -13749,10 +13773,12 @@
         return true;
       });
     const parsedMinRequired = Number.parseInt(group?.minRequired, 10);
+    const parsedNextStepIndex = Number.parseInt(group?.nextStepIndex, 10);
     const maxRequired = Math.max(1, conditions.length);
     return {
       conditions,
       minRequired: Math.min(maxRequired, Math.max(1, Number.isFinite(parsedMinRequired) ? parsedMinRequired : 1)),
+      nextStepIndex: Number.isInteger(parsedNextStepIndex) && parsedNextStepIndex >= 0 ? parsedNextStepIndex : null,
     };
   };
 
@@ -13788,7 +13814,10 @@
     const rawKey = String(gardenCraftKey || '').trim();
     const keyParts = rawKey.split('|');
     const normalizedKey = keyParts.pop() || '';
-    const prefixedCategory = keyParts.find((part) => GARDEN_CRAFT_CATEGORY_OPTIONS.some((option) => option.value === part));
+    const prefixedCategory = keyParts.find((part) => (
+      LEGACY_GARDEN_CRAFT_CATEGORY_VALUES.has(part)
+      || CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS.some((option) => option.value === part)
+    ));
     const catalystMatch = action === 'gardenCraft' && normalizedKey.match(/^catalyst:(\d+)$/);
     const legacyEnchantment = action === 'gardenCraft' && /^enchantment:\d+$/.test(normalizedKey);
     return {
@@ -13825,7 +13854,7 @@
     craftCategory = CRAFT_BENCH_CATEGORY_OPTIONS[0].value,
     craftId = '',
     note = '',
-    gardenCraftCategory = GARDEN_CRAFT_CATEGORY_OPTIONS[0].value,
+    gardenCraftCategory = CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS[0].value,
     gardenCraftKey = '',
   ) => {
     const migratedGardenCraft = migrateGardenCraftSelection(action, gardenCraftCategory, gardenCraftKey);
@@ -13836,9 +13865,9 @@
       ? craftCategory
       : CRAFT_BENCH_CATEGORY_OPTIONS[0].value;
     const normalizedCraftId = Number.parseInt(craftId, 10);
-    const normalizedGardenCraftCategory = GARDEN_CRAFT_CATEGORY_OPTIONS.some((option) => option.value === migratedGardenCraft.category)
+    const normalizedGardenCraftCategory = CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS.some((option) => option.value === migratedGardenCraft.category)
       ? migratedGardenCraft.category
-      : GARDEN_CRAFT_CATEGORY_OPTIONS[0].value;
+      : CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS[0].value;
     return {
       action: CONTINUOUS_CRAFT_ACTIONS[normalizedAction] ? normalizedAction : 'alteration',
       craftCategory: normalizedCraftCategory,
@@ -13852,6 +13881,9 @@
       note: normalizeContinuousStepNote(note),
       conditionGroups: (Array.isArray(conditionGroups) ? conditionGroups : [createEmptyAffixConditionGroup()])
         .map(normalizeAffixConditionGroup),
+      ...(normalizedAction === 'gardenCraft' && LEGACY_GARDEN_CRAFT_CATEGORY_VALUES.has(migratedGardenCraft.category)
+        ? { legacyGardenCraftCategory: migratedGardenCraft.category }
+        : {}),
     };
   };
 
@@ -13880,7 +13912,7 @@
     const failureTargetStepIndex = Number.parseInt(rawStep.failureTargetStepIndex, 10);
     const conditionGroups = (Array.isArray(rawStep.conditionGroups) ? rawStep.conditionGroups : [])
       .map(normalizeAffixConditionGroup);
-    return createContinuousCraftStep(
+    const normalizedStep = createContinuousCraftStep(
       action,
       conditionGroups.length ? conditionGroups : [createEmptyAffixConditionGroup()],
       failureHandling,
@@ -13893,6 +13925,14 @@
       rawStep.gardenCraftCategory,
       rawStep.gardenCraftKey,
     );
+    const legacyGardenCraftCategory = String(
+      rawStep.legacyGardenCraftCategory
+      || (action === 'gardenCraft' && LEGACY_GARDEN_CRAFT_CATEGORY_VALUES.has(rawStep.gardenCraftCategory)
+        ? rawStep.gardenCraftCategory
+        : ''),
+    );
+    if (legacyGardenCraftCategory) normalizedStep.legacyGardenCraftCategory = legacyGardenCraftCategory;
+    return normalizedStep;
   };
 
   /**
@@ -15225,11 +15265,11 @@
    * @param {Array<object>} conditionGroups 条件组。
    * @returns {boolean} 满足条件时返回 true。
    */
-  const isAffixMatched = (equipmentOrAffixes, conditionGroups) => {
+  const getFirstMatchedAffixConditionGroupIndex = (equipmentOrAffixes, conditionGroups) => {
     const equipment = Array.isArray(equipmentOrAffixes) ? { affixes: equipmentOrAffixes } : (equipmentOrAffixes || {});
     const affixNames = getAffixNames(equipment.affixes);
-    if (!conditionGroups.length) return false;
-    return conditionGroups.some((group) => {
+    if (!conditionGroups.length) return -1;
+    return conditionGroups.findIndex((group) => {
       const normalizedGroup = normalizeAffixConditionGroup(group);
       const cleanGroup = normalizedGroup.conditions;
       if (!cleanGroup.length) return false;
@@ -15240,6 +15280,10 @@
       return matchedCount >= requiredCount;
     });
   };
+
+  const isAffixMatched = (equipmentOrAffixes, conditionGroups) => (
+    getFirstMatchedAffixConditionGroupIndex(equipmentOrAffixes, conditionGroups) >= 0
+  );
 
   /**
    * getMagicAffixSummary 统计魔法装备的前后缀数量。
@@ -15464,9 +15508,6 @@
       targetCount,
       targetColor,
       useStorage: state.useStorage,
-      lockedEquipments: state.craftAdvancedFilterLocked
-        ? state.craftLockedEquipmentResults.map((equipment) => normalizeEquipment({ ...equipment }))
-        : null,
       affixConditionGroups: getAffixConditionGroups(),
       continuousCraftSteps: getContinuousCraftSteps(),
       batchStoneType: Number.parseInt(state.ui.batchStoneSelect.value, 10),
@@ -15597,6 +15638,33 @@
         }
         : null,
     };
+  };
+
+  const migrateCraftPlanGardenCategories = async (plan) => {
+    if (!plan?.options?.continuousCraftSteps) return plan;
+    const legacySteps = plan.options.continuousCraftSteps
+      .map((step, stepIndex) => (step?.action === 'gardenCraft' && step?.legacyGardenCraftCategory ? stepIndex : -1))
+      .filter((stepIndex) => stepIndex >= 0);
+    if (!legacySteps.length) return plan;
+    await ensureGardenAndCatalystStartupData();
+    const failedSteps = new Set(plan.gardenCraftCompatibilitySteps || []);
+    for (const stepIndex of legacySteps) {
+      const step = plan.options.continuousCraftSteps[stepIndex];
+      if (!String(step.gardenCraftKey || '').trim()) {
+        delete step.legacyGardenCraftCategory;
+        continue;
+      }
+      const craft = findLoadedGardenCraftByKey(step.gardenCraftKey);
+      if (!craft) {
+        step.gardenCraftKey = '';
+        failedSteps.add(stepIndex);
+      } else {
+        step.gardenCraftCategory = getGardenCraftSemanticCategoryValue(craft);
+      }
+      delete step.legacyGardenCraftCategory;
+    }
+    plan.gardenCraftCompatibilitySteps = [...failedSteps].sort((left, right) => left - right);
+    return plan;
   };
 
   /**
@@ -15784,7 +15852,7 @@
   };
 
   /**
-   * compactAffixConditionGroups 把条件组压成 [命中数, 条件列表]。
+   * compactAffixConditionGroups 把条件组压成 [命中数, 条件列表, 命中后步骤]。
    * @param {Array<object>} groups 标准条件组。
    * @returns {Array<Array>} 精简条件组列表。
    */
@@ -15799,6 +15867,7 @@
           ? formatCraftPlanConditionLocation({ stepIndex, groupIndex, conditionIndex })
           : '',
       )),
+      group.nextStepIndex,
     ]);
 
   /**
@@ -15817,6 +15886,7 @@
             ? formatCraftPlanConditionLocation({ stepIndex, groupIndex, conditionIndex })
             : '',
         )),
+        nextStepIndex: Number.isInteger(group[2]) ? group[2] : null,
       });
     })
     .filter((group) => group.conditions.length > 0);
@@ -15830,17 +15900,26 @@
       return Math.max(0, Math.min(rawIndex, stepCount));
     };
     normalizedSteps.forEach((step, stepIndex) => {
-      if (step.successHandling === 'jump') {
+      if (step.action !== 'multiConditionCheck' && step.successHandling === 'jump') {
         const targetIndex = resolveTarget(step.successTargetStepIndex, stepIndex + 1);
         if (targetIndex >= stepCount) {
           labels.push(`步骤${formatContinuousStepCode(stepIndex)} 的下一步/条件成立跳转`);
         }
       }
-      if (step.action === 'conditionCheck' && step.failureHandling === 'jump') {
+      if (isContinuousConditionAction(step.action) && step.failureHandling === 'jump') {
         const targetIndex = resolveTarget(step.failureTargetStepIndex, stepIndex);
         if (targetIndex >= stepCount) {
           labels.push(`步骤${formatContinuousStepCode(stepIndex)} 的条件不成立跳转`);
         }
+      }
+      if (step.action === 'multiConditionCheck') {
+        step.conditionGroups.forEach((group, groupIndex) => {
+          if (!group.conditions.length) return;
+          const targetIndex = resolveTarget(group.nextStepIndex, stepIndex + 1);
+          if (targetIndex >= stepCount) {
+            labels.push(`步骤${formatContinuousStepCode(stepIndex)} 条件组 ${groupIndex + 1} 的命中后跳转`);
+          }
+        });
       }
     });
     return labels;
@@ -16111,7 +16190,12 @@
       );
     }
     const normalizedPlan = assertCraftPlanAffixesRecognized(normalizeCraftPlan(expandedPlan));
-    if (normalizedPlan.gardenCraftCompatibilitySteps.length) normalizedPlan.rawStoragePlan = rawPlan;
+    if (
+      normalizedPlan.gardenCraftCompatibilitySteps.length
+      || normalizedPlan.options.continuousCraftSteps.some((step) => step.legacyGardenCraftCategory)
+    ) {
+      normalizedPlan.rawStoragePlan = rawPlan;
+    }
     return normalizedPlan;
   };
 
@@ -16145,8 +16229,7 @@
     ensureCraftPlansHydrated();
     const storedPlans = state.craftPlans.map((plan) => (
       plan.storageMigrationError
-      || (plan.legacyPartialCompatibility?.steps?.length && plan.rawStoragePlan)
-      || (plan.gardenCraftCompatibilitySteps?.length && plan.rawStoragePlan)
+      || plan.rawStoragePlan
         ? plan.rawStoragePlan
         : serializeCraftPlanForStorage(plan)
     ));
@@ -16282,7 +16365,7 @@
   /**
    * loadSelectedCraftPlan 读取当前下拉框选中的本地自定义方案。
    */
-  const loadSelectedCraftPlan = () => {
+  const loadSelectedCraftPlan = async () => {
     ensureCraftPlansHydrated();
     const planId = state.ui.craftPlanSelect?.value;
     const plan = state.craftPlans.find((savedPlan) => savedPlan.id === planId);
@@ -16292,8 +16375,10 @@
     }
     if (plan.storageMigrationError) {
       addLog(`无法读取本地方案“${plan.name}”：${plan.storageMigrationError}`, 'warn');
+      switchMainTab('logs');
       return;
     }
+    await migrateCraftPlanGardenCategories(plan);
     applyCraftPlanOptions(plan.options);
     switchToContinuousCraftTab();
     setInputValue(state.ui.craftPlanNameInput, plan.name);
@@ -16309,7 +16394,8 @@
     }
     if (plan.gardenCraftCompatibilitySteps?.length) {
       const stepNumbers = [...new Set(plan.gardenCraftCompatibilitySteps.map((stepIndex) => stepIndex + 1))].sort((left, right) => left - right);
-      addLog(`已部分兼容并读取自定义方案“${plan.name}”：第 ${stepNumbers.join('、')} 步的旧花园附魔已清空，请重新选择。`, 'warn');
+      addLog(`已部分兼容并读取自定义方案“${plan.name}”：第 ${stepNumbers.join('、')} 步的旧花园工艺无法迁移，已清空，请重新选择。`, 'warn');
+      switchMainTab('logs');
     }
     if (!plan.legacyPartialCompatibility?.steps?.length && !plan.gardenCraftCompatibilitySteps?.length) {
       addLog(`已读取自定义方案：${plan.name}`, 'compact');
@@ -16354,13 +16440,15 @@
    */
   const importCraftPlanCode = async () => {
     const plan = await decodeCraftPlanShareCode(state.ui.craftPlanShareTextarea?.value);
+    await migrateCraftPlanGardenCategories(plan);
     setInputValue(state.ui.craftPlanSelect, '');
     setInputValue(state.ui.craftPlanNameInput, plan.name);
     applyCraftPlanOptions(plan.options);
     switchToContinuousCraftTab();
     if (plan.gardenCraftCompatibilitySteps?.length) {
       const stepNumbers = plan.gardenCraftCompatibilitySteps.map((stepIndex) => stepIndex + 1);
-      addLog(`已部分兼容并导入自定义方案“${plan.name}”：第 ${stepNumbers.join('、')} 步的旧花园附魔已清空，请重新选择；如需保留，请点击保存方案。`, 'warn');
+      addLog(`已部分兼容并导入自定义方案“${plan.name}”：第 ${stepNumbers.join('、')} 步的旧花园工艺无法迁移，已清空，请重新选择；如需保留，请点击保存方案。`, 'warn');
+      switchMainTab('logs');
     } else {
       addLog(`已导入并读取自定义方案：${plan.name}。如需保留，请点击保存方案。`, 'compact');
     }
@@ -17164,9 +17252,9 @@
     }
     const executionOptions = {
       ...options,
-      rarity: Array.isArray(options.lockedEquipments) ? options.rarity : plan.rarity,
-      targetCount: Array.isArray(options.lockedEquipments) ? options.targetCount : plan.targetCount,
-      useStorage: Array.isArray(options.lockedEquipments) ? options.useStorage : plan.useStorage,
+      rarity: plan.rarity,
+      targetCount: plan.targetCount,
+      useStorage: plan.useStorage,
     };
     addMainLog(`连续批量已锁定本次配置快照：${runnableSteps.length} 个步骤，每个步骤目标 ${executionOptions.targetCount} 件，稀有度 ${getAdvancedBatchRarityLabel(executionOptions.rarity)}，读取位置 ${executionOptions.useStorage ? '储藏' : '背包'}。运行期间继续修改 UI 不会影响当前任务。`);
     const totalUniqueCounts = new Map();
@@ -17877,30 +17965,6 @@
     const { baseType } = parseUniqueCraftBaseKey(step.baseType);
     const droppedEntries = [];
     const seenIds = new Set();
-    if (Array.isArray(executionOptions.lockedEquipments)) {
-      const lockedUniqueCandidates = getLockedEquipmentCandidates({
-        ...executionOptions,
-        keyword: '',
-        exactBaseName: baseType,
-        exactEquipmentTypeMask: getUniqueCraftBaseSelectionMask(step.baseType),
-        rarity: RARITY_TYPES.unique,
-        excludeCorrupted: false,
-        excludeFractured: true,
-        excludeRarities: [],
-      }) || [];
-      for (const rawEquipment of lockedUniqueCandidates) {
-        if (!state.isRunning) break;
-        const equipment = normalizeEquipment({ ...rawEquipment });
-        await refreshUniqueCraftEquipmentDetail(equipment, '并入掉落暗金前');
-        const catalogItem = findUniqueCatalogItem(equipment);
-        const targetEntry = catalogItem ? targetByKey.get(getUniqueCraftItemKey(catalogItem)) : null;
-        if (!targetEntry) continue;
-        state.processedEquipmentIds.add(equipment.id);
-        droppedEntries.push({ equipment, catalogItem, targetConfig: targetEntry.targetConfig });
-      }
-      addLog(`暗金打造步骤 ${step.stepIndex + 1}：从公共高级筛选锁定结果中并入掉落暗金 ${droppedEntries.length} 件。`, droppedEntries.length ? 'compact' : 'detail');
-      return droppedEntries;
-    }
     const targetSearchNames = [...new Set(activeTargetEntries.flatMap(([, , item]) => {
       return [String(item?.name || '').trim()].filter(Boolean);
     }))];
@@ -17914,7 +17978,6 @@
       const query = {
         ...executionOptions,
         keyword: targetName,
-        pageSize: 100,
         exactBaseName: baseType,
         exactEquipmentTypeMask: getUniqueCraftBaseSelectionMask(step.baseType),
         rarity: RARITY_TYPES.unique,
@@ -17936,7 +17999,7 @@
           const equipment = normalizeEquipment(rawEquipment);
           await refreshUniqueCraftEquipmentDetail(equipment, '并入掉落暗金前');
           if (isEquipmentFractured(equipment)) {
-            addStepLog(`${equipment.name} 是破裂装备，已跳过并入掉落暗金处理。`);
+            addStepLog(`${equipment.name} 存在锁定词缀，已跳过并入掉落暗金处理。`);
             continue;
           }
           const catalogItem = findUniqueCatalogItem(equipment);
@@ -17960,6 +18023,10 @@
   };
 
   const processUniqueCraftDroppedTargetEntry = async ({ equipment, catalogItem, targetConfig }, runtimeContext = {}) => {
+    if (isEquipmentFractured(equipment)) {
+      addStepLog(`${equipment.name} 存在锁定词缀，已跳过暗金打造后处理。`);
+      return { equipment, unique: true, destroyed: false, stored: false, matchedTarget: false, droppedUnique: true, skippedLockedAffix: true };
+    }
     const corrupted = isEquipmentCorrupted(equipment);
     const processingConfig = corrupted
       ? {
@@ -17986,8 +18053,8 @@
 
   const processUniqueCraftEquipment = async (equipment, step, runtimeContext = {}) => {
     if (isEquipmentFractured(equipment)) {
-      addStepLog(`${equipment.name} 是破裂装备，已跳过暗金打造。`);
-      return { equipment, unique: Number(equipment.rarity) === RARITY_TYPES.unique, destroyed: false, stored: false, matchedTarget: false, skippedFractured: true };
+      addStepLog(`${equipment.name} 存在锁定词缀，已跳过暗金打造。`);
+      return { equipment, unique: Number(equipment.rarity) === RARITY_TYPES.unique, destroyed: false, stored: false, matchedTarget: false, skippedFractured: true, skippedLockedAffix: true };
     }
     const startResult = await applyUniqueCraftStartMode(equipment, step);
     if (startResult.stopped) {
@@ -18077,8 +18144,8 @@
     });
     const executionOptions = {
       ...options,
-      targetCount: Array.isArray(options.lockedEquipments) ? options.targetCount : plan.targetCount,
-      useStorage: Array.isArray(options.lockedEquipments) ? options.useStorage : plan.useStorage,
+      targetCount: plan.targetCount,
+      useStorage: plan.useStorage,
     };
     state.currentTaskTargetCount = executionOptions.targetCount;
     addMainLog(`暗金打造已锁定本次配置快照：${runnableSteps.length} 个步骤，每步骤目标 ${executionOptions.targetCount} 件，读取位置 ${executionOptions.useStorage ? '储藏' : '背包'}。运行期间继续修改 UI 不会影响当前任务。`);
@@ -18086,13 +18153,9 @@
     let totalProcessedCount = 0;
     let totalDestroyedCount = 0;
     let totalStoredCount = 0;
+    let totalKeptCount = 0;
     let totalFailedCount = 0;
-    let totalMatchedTargetCount = 0;
-    let totalUnmatchedUniqueCount = 0;
-    let totalRollSkippedCount = 0;
-    let totalStoppedCount = 0;
     let totalDroppedMergedCount = 0;
-    let totalPostProcessSkippedCount = 0;
     const runtimeContext = { rejectedActionReasons: new Map() };
     for (const step of runnableSteps) {
       if (!state.isRunning) break;
@@ -18142,48 +18205,26 @@
       let stepProcessedCount = 0;
       let stepDestroyedCount = 0;
       let stepStoredCount = 0;
-      let stepMatchedTargetCount = 0;
-      let stepUnmatchedUniqueCount = 0;
-      let stepRollSkippedCount = 0;
-      let stepStoppedCount = 0;
+      let stepKeptCount = 0;
       let stepDroppedMergedCount = 0;
-      let stepPostProcessSkippedCount = 0;
       for (const result of results) {
         if (!result || result.error) continue;
+        if (result.skippedLockedAffix) continue;
         stepProcessedCount += 1;
         totalProcessedCount += 1;
         if (result.droppedUnique) {
           stepDroppedMergedCount += 1;
           totalDroppedMergedCount += 1;
         }
-        if (result.stopped) {
-          stepStoppedCount += 1;
-          totalStoppedCount += 1;
-        }
-        if (result.matchedTarget) {
-          stepMatchedTargetCount += 1;
-          totalMatchedTargetCount += 1;
-        } else if (result.stopped) {
-          // 任务停止结果不应统计为未配置暗金。
-        } else if (result.unique && Number(result.equipment?.rarity) === RARITY_TYPES.unique) {
-          stepUnmatchedUniqueCount += 1;
-          totalUnmatchedUniqueCount += 1;
-        }
-        if (result.rollSkippedRest) {
-          stepRollSkippedCount += 1;
-          totalRollSkippedCount += 1;
-        }
-        if (result.stageError) {
-          stepPostProcessSkippedCount += 1;
-          totalPostProcessSkippedCount += 1;
-        }
         if (result.destroyed) {
           stepDestroyedCount += 1;
           totalDestroyedCount += 1;
-        }
-        if (result.stored) {
+        } else if (result.stored) {
           stepStoredCount += 1;
           totalStoredCount += 1;
+        } else {
+          stepKeptCount += 1;
+          totalKeptCount += 1;
         }
         if (result.unique && Number(result.equipment?.rarity) === RARITY_TYPES.unique) {
           incrementEquipmentNameCount(stepUniqueCounts, result.equipment);
@@ -18191,10 +18232,9 @@
         }
       }
       const stepSummaryPrefix = state.isRunning ? '结束' : '停止';
-      addMainLog(`暗金打造步骤 ${step.stepIndex + 1}/${runnableSteps.length} ${stepSummaryPrefix}：处理${stepProcessedCount}件，并入掉落暗金${stepDroppedMergedCount}件，暗金${[...stepUniqueCounts.values()].reduce((sum, count) => sum + count, 0)}件，目标命中${stepMatchedTargetCount}件，未配置${stepUnmatchedUniqueCount}件，Roll跳过${stepRollSkippedCount}件，后处理跳过${stepPostProcessSkippedCount}件，停止${stepStoppedCount}件，丢弃${stepDestroyedCount}件，存储${stepStoredCount}件，异常${failedResults.length + stageFailedResults.length}件。`);
-      logAdvancedBatchUniqueSummary(stepUniqueCounts, `暗金打造步骤 ${step.stepIndex + 1} 基底“${stepBaseLabel}”暗金统计`);
+      addMainLog(`暗金打造步骤 ${step.stepIndex + 1}/${runnableSteps.length} ${stepSummaryPrefix}：处理${stepProcessedCount}件，并入掉落${stepDroppedMergedCount}件，丢弃${stepDestroyedCount}件，存储${stepStoredCount}件，保留${stepKeptCount}件，异常${failedResults.length + stageFailedResults.length}件；暗金：${formatAdvancedBatchUniqueSummary(stepUniqueCounts)}。`);
     }
-    addLog(`暗金打造${state.isRunning ? '完成' : '停止汇总'}：处理${totalProcessedCount}件，并入掉落暗金${totalDroppedMergedCount}件，暗金${[...totalUniqueCounts.values()].reduce((sum, count) => sum + count, 0)}件，目标命中${totalMatchedTargetCount}件，未配置${totalUnmatchedUniqueCount}件，Roll跳过${totalRollSkippedCount}件，后处理跳过${totalPostProcessSkippedCount}件，停止${totalStoppedCount}件，丢弃${totalDestroyedCount}件，存储${totalStoredCount}件，异常${totalFailedCount}件；${formatAdvancedBatchUniqueSummary(totalUniqueCounts)}。`, totalFailedCount || !state.isRunning ? 'warn' : 'success');
+    addLog(`暗金打造${state.isRunning ? '完成' : '停止汇总'}：处理${totalProcessedCount}件，并入掉落${totalDroppedMergedCount}件，丢弃${totalDestroyedCount}件，存储${totalStoredCount}件，保留${totalKeptCount}件，异常${totalFailedCount}件；暗金：${formatAdvancedBatchUniqueSummary(totalUniqueCounts)}。`, totalFailedCount || !state.isRunning ? 'warn' : 'success');
   };
 
   /**
@@ -18675,6 +18715,10 @@
    * @param {number} targetCount 本轮目标数量，用于并发命中后尽快停止其他 worker。
    */
   const processChanceUnique = async (equipment, targetCount = Number.POSITIVE_INFINITY) => {
+    if (isEquipmentFractured(equipment)) {
+      addLog(`${equipment.name} 存在锁定词缀，已跳过自动暗金。`, 'warn');
+      return { matched: false, skipped: true, skippedLockedAffix: true };
+    }
     const rollResult = await rollChanceUniqueUntilMatched(equipment, () => state.completedCount >= targetCount);
     if (rollResult.skipped) {
       addLog(`${equipment.name} 原本就是暗金，跳过自动暗金。`, 'warn');
@@ -18733,6 +18777,7 @@
         equipment = await getNextEquipment({
           ...options,
           excludeRarities: [RARITY_TYPES.unique],
+          excludeFractured: true,
         });
       } catch (error) {
         if (isRequestAbortError(error)) break;
@@ -18940,7 +18985,7 @@
       if (['gardenCraft', 'catalyst'].includes(step.action) && !step.gardenCraftKey) {
         throw new Error(`${stepLabel} 需要先选择具体${step.action === 'catalyst' ? '催化剂' : '花园工艺方法'}。`);
       }
-      if (step.action === 'conditionCheck' && conditionGroups.length) {
+      if (isContinuousConditionAction(step.action) && conditionGroups.length) {
         assertAffixConditionsPossible(conditionGroups, actionConfig.limits, stepLabel);
       }
     });
@@ -19035,11 +19080,12 @@
    * @param {object} equipment 装备对象。
    * @param {object} step 连续打造步骤。
    * @param {number} stepIndex 步骤下标，用于日志。
-   * @returns {Promise<boolean>} 本步骤命中或无需命中时返回 true。
+   * @returns {Promise<boolean|object>} 普通步骤返回是否命中；多条件判断额外返回命中的条件组下标。
    */
   const executeContinuousCraftStep = async (equipment, step, stepIndex) => {
     const normalizedStep = normalizeContinuousCraftStep(step);
     const actionConfig = CONTINUOUS_CRAFT_ACTIONS[normalizedStep.action];
+    const allConditionGroups = normalizedStep.conditionGroups;
     const conditionGroups = normalizedStep.conditionGroups.filter((group) => group.conditions.length > 0);
     recordContinuousStepExecution(stepIndex, actionConfig.label);
     addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 开始：${actionConfig.label}，条件组 ${conditionGroups.length} 个。`);
@@ -19050,6 +19096,12 @@
       const matched = isAffixMatched(equipment, conditionGroups);
       addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 判断条件：条件${matched ? '成立' : '不成立'}。`);
       return matched;
+    }
+    if (normalizedStep.action === 'multiConditionCheck') {
+      const matchedGroupIndex = getFirstMatchedAffixConditionGroupIndex(equipment, allConditionGroups);
+      const matched = matchedGroupIndex >= 0;
+      addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 多条件判断：${matched ? `条件组 ${formatContinuousStepCode(stepIndex)}-${matchedGroupIndex + 1} 成立` : '所有条件组均不成立'}。`);
+      return { matched, matchedGroupIndex };
     }
     if (normalizedStep.action === 'none') {
       addStepLog(`${equipment.name} 自定义打造步骤 ${formatContinuousStepCode(stepIndex)} 无动作完成。`);
@@ -19132,16 +19184,26 @@
     CONTINUOUS_STEP_HANDLINGS[handling] ? handling : fallbackHandling
   );
 
-  const handleContinuousStepRouting = async (equipment, step, stepIndex, maxStepCount, resultType) => {
+  const handleContinuousStepRouting = async (equipment, step, stepIndex, maxStepCount, resultType, matchedGroupIndex = -1) => {
     const normalizedStep = normalizeContinuousCraftStep(step);
     const stepCode = formatContinuousStepCode(stepIndex);
     const isSuccess = resultType === 'success';
-    const isConditionStep = normalizedStep.action === 'conditionCheck';
-    const handling = isConditionStep
+    const isConditionStep = isContinuousConditionAction(normalizedStep.action);
+    const isMultiConditionStep = normalizedStep.action === 'multiConditionCheck';
+    const matchedGroup = isMultiConditionStep && isSuccess && matchedGroupIndex >= 0
+      ? normalizedStep.conditionGroups[matchedGroupIndex]
+      : null;
+    const handling = matchedGroup
+      ? 'jump'
+      : isConditionStep
       ? (isSuccess ? normalizedStep.successHandling : normalizedStep.failureHandling)
       : normalizedStep.successHandling;
-    const targetStepIndex = isSuccess ? normalizedStep.successTargetStepIndex : normalizedStep.failureTargetStepIndex;
-    const statusText = isConditionStep
+    const targetStepIndex = matchedGroup
+      ? matchedGroup.nextStepIndex
+      : (isSuccess ? normalizedStep.successTargetStepIndex : normalizedStep.failureTargetStepIndex);
+    const statusText = matchedGroup
+      ? `条件组 ${formatContinuousStepCode(stepIndex)}-${matchedGroupIndex + 1} 成立`
+      : isConditionStep
       ? (isSuccess ? '条件成立' : '条件不成立')
       : (isSuccess ? '动作完成' : '动作未完成');
     if (CONTINUOUS_STEP_TERMINATION_HANDLINGS[handling]) {
@@ -19166,7 +19228,7 @@
 
   const getContinuousRoutingOutcomesForAnalysis = (step, stepIndex, maxStepCount) => {
     const normalizedStep = normalizeContinuousCraftStep(step);
-    const isConditionStep = normalizedStep.action === 'conditionCheck';
+    const isConditionStep = isContinuousConditionAction(normalizedStep.action);
     const createTarget = (handling, targetStepIndex, fallbackStepIndex) => {
       if (handling === 'terminateSuccess') return [{ type: 'successExit' }];
       if (CONTINUOUS_STEP_NORMAL_EXIT_HANDLINGS.has(handling)) return [{ type: 'normalExit' }];
@@ -19177,6 +19239,14 @@
     };
     if (!isConditionStep) {
       return createTarget(normalizedStep.successHandling, normalizedStep.successTargetStepIndex, stepIndex + 1);
+    }
+    if (normalizedStep.action === 'multiConditionCheck') {
+      return [
+        ...normalizedStep.conditionGroups
+          .filter((group) => group.conditions.length > 0)
+          .flatMap((group) => createTarget('jump', group.nextStepIndex, stepIndex + 1)),
+        ...createTarget(normalizedStep.failureHandling, normalizedStep.failureTargetStepIndex, stepIndex),
+      ];
     }
     return [
       ...createTarget(normalizedStep.successHandling, normalizedStep.successTargetStepIndex, stepIndex + 1),
@@ -19201,7 +19271,7 @@
       if (bestDepth !== undefined && bestDepth <= depthBefore) continue;
       bestDepthBeforeStep.set(index, depthBefore);
       const step = normalizedSteps[index];
-      const isConditionStep = step.action === 'conditionCheck';
+      const isConditionStep = isContinuousConditionAction(step.action);
       const depthAfterStep = isConditionStep ? depthBefore + 1 : depthBefore;
       if (isConditionStep) {
         const previousDepth = conditionDepths.get(index);
@@ -19234,9 +19304,19 @@
     }
     normalizedSteps.forEach((step, stepIndex) => {
       const normalizedStep = normalizeContinuousCraftStep(step);
-      if (normalizedStep.action !== 'conditionCheck') return;
+      if (!isContinuousConditionAction(normalizedStep.action)) return;
       const branches = [
-        { label: '条件成立', handling: normalizedStep.successHandling, targetStepIndex: normalizedStep.successTargetStepIndex, fallbackStepIndex: stepIndex + 1 },
+        ...(normalizedStep.action === 'multiConditionCheck'
+          ? normalizedStep.conditionGroups
+            .map((group, groupIndex) => ({ group, groupIndex }))
+            .filter((entry) => entry.group.conditions.length > 0)
+            .map(({ group, groupIndex }) => ({
+              label: `条件组 ${groupIndex + 1} 命中后`,
+              handling: 'jump',
+              targetStepIndex: group.nextStepIndex,
+              fallbackStepIndex: stepIndex + 1,
+            }))
+          : [{ label: '条件成立', handling: normalizedStep.successHandling, targetStepIndex: normalizedStep.successTargetStepIndex, fallbackStepIndex: stepIndex + 1 }]),
         { label: '条件不成立', handling: normalizedStep.failureHandling, targetStepIndex: normalizedStep.failureTargetStepIndex, fallbackStepIndex: stepIndex },
       ];
       branches.forEach((branch) => {
@@ -19290,7 +19370,7 @@
   const processContinuousCraftSteps = async (equipment, steps) => {
     const normalizedSteps = normalizeContinuousCraftSteps(steps);
     normalizedSteps.forEach((step, stepIndex) => {
-      if (step.action !== 'conditionCheck') return;
+      if (!isContinuousConditionAction(step.action)) return;
       const conditionGroups = step.conditionGroups.filter((group) => group.conditions.length > 0);
       if (!conditionGroups.length) return;
       assertJewelAffixConditionsPossible(
@@ -19324,10 +19404,19 @@
           }
         }
       }
-      const stepMatched = await executeContinuousCraftStep(equipment, normalizedSteps[stepIndex], stepIndex);
+      const stepResult = await executeContinuousCraftStep(equipment, normalizedSteps[stepIndex], stepIndex);
+      const stepMatched = typeof stepResult === 'object' ? Boolean(stepResult.matched) : Boolean(stepResult);
+      const matchedGroupIndex = typeof stepResult === 'object' ? Number(stepResult.matchedGroupIndex) : -1;
       const previousStepIndex = stepIndex;
       if (stepMatched) {
-        stepIndex = await handleContinuousStepRouting(equipment, normalizedSteps[stepIndex], stepIndex, normalizedSteps.length, 'success');
+        stepIndex = await handleContinuousStepRouting(
+          equipment,
+          normalizedSteps[stepIndex],
+          stepIndex,
+          normalizedSteps.length,
+          'success',
+          matchedGroupIndex,
+        );
       } else {
         if (!state.isRunning) return false;
         stepIndex = await handleContinuousStepRouting(equipment, normalizedSteps[stepIndex], stepIndex, normalizedSteps.length, 'failure');
@@ -21347,312 +21436,6 @@
     addLog(`装备筛选完成：${getEquipmentFilterLocationLabel(options.location)}匹配 ${state.equipmentFilterResults.length} 件${targetText}。`, 'compact');
   };
 
-  const setCraftAdvancedFilterSummary = (text) => {
-    if (state.ui.craftAdvancedFilterSummary) state.ui.craftAdvancedFilterSummary.textContent = text;
-  };
-
-  const invalidateCraftLockedEquipmentResults = (message = '高级筛选条件已修改，请重新扫描并锁定结果。') => {
-    const hadLockedResults = state.craftAdvancedFilterLocked || state.craftLockedEquipmentResults.length;
-    state.craftAdvancedFilterRevision += 1;
-    state.craftAdvancedFilterLocked = false;
-    state.craftLockedEquipmentResults = [];
-    if (state.ui.craftAdvancedFilterScanButton) state.ui.craftAdvancedFilterScanButton.textContent = '扫描并锁定结果';
-    setCraftAdvancedFilterSummary(hadLockedResults ? message : '尚未锁定结果；未扫描时仍按上方基础筛选实时取件。');
-  };
-
-  const getCraftAdvancedFilterGroupLabel = (groupIndex) => `A-${groupIndex + 1}`;
-
-  const getActiveCraftAdvancedFilterGroupIndex = () => {
-    const rawIndex = Number.parseInt(state.ui.craftAdvancedFilterGroupSelect?.value || '0', 10);
-    if (!Number.isInteger(rawIndex) || rawIndex < 0) return 0;
-    return state.craftAdvancedFilterConditionGroups[rawIndex] ? rawIndex : 0;
-  };
-
-  const setCraftAdvancedFilterGroupMinRequired = (groupIndex, value) => {
-    const currentGroup = normalizeAffixConditionGroup(state.craftAdvancedFilterConditionGroups[groupIndex]);
-    const parsedValue = Number.parseInt(value, 10);
-    state.craftAdvancedFilterConditionGroups[groupIndex] = {
-      ...currentGroup,
-      minRequired: Math.min(
-        Math.max(1, currentGroup.conditions.length),
-        Math.max(1, Number.isFinite(parsedValue) ? parsedValue : 1),
-      ),
-    };
-    invalidateCraftLockedEquipmentResults();
-    renderCraftAdvancedFilterConditionBuilder();
-  };
-
-  const renderCraftAdvancedFilterConditionBuilder = () => {
-    const groupSelect = state.ui.craftAdvancedFilterGroupSelect;
-    const groupList = state.ui.craftAdvancedFilterGroupList;
-    if (!groupSelect || !groupList) return;
-    if (!state.craftAdvancedFilterConditionGroups.length) {
-      state.craftAdvancedFilterConditionGroups = [createEmptyAffixConditionGroup()];
-    }
-    state.craftAdvancedFilterConditionGroups = state.craftAdvancedFilterConditionGroups.map(normalizeAffixConditionGroup);
-    const selectedIndex = Math.min(
-      getActiveCraftAdvancedFilterGroupIndex(),
-      state.craftAdvancedFilterConditionGroups.length - 1,
-    );
-    groupSelect.replaceChildren(...state.craftAdvancedFilterConditionGroups.map((group, groupIndex) => {
-      const option = createElement('option', {
-        value: String(groupIndex),
-        textContent: `${getCraftAdvancedFilterGroupLabel(groupIndex)}（${group.conditions.length} 条，命中 ${Math.min(group.minRequired, Math.max(group.conditions.length, 1))}）`,
-      });
-      option.selected = groupIndex === selectedIndex;
-      return option;
-    }));
-    groupList.replaceChildren(...state.craftAdvancedFilterConditionGroups.map((group, groupIndex) => {
-      const minInput = createElement('input', {
-        className: 'poe2-input poe2-affix-min-input',
-        type: 'number',
-        value: String(group.minRequired),
-        onChange: (event) => setCraftAdvancedFilterGroupMinRequired(groupIndex, event.target.value),
-      });
-      minInput.min = '1';
-      minInput.max = String(Math.max(1, group.conditions.length));
-      const conditionElements = group.conditions.length
-        ? group.conditions.map((condition, conditionIndex) => createElement('button', {
-          className: 'poe2-affix-chip',
-          textContent: formatAffixConditionLabel(condition),
-          onClick: () => {
-            const nextGroup = normalizeAffixConditionGroup(state.craftAdvancedFilterConditionGroups[groupIndex]);
-            nextGroup.conditions.splice(conditionIndex, 1);
-            state.craftAdvancedFilterConditionGroups[groupIndex] = nextGroup;
-            invalidateCraftLockedEquipmentResults();
-            renderCraftAdvancedFilterConditionBuilder();
-          },
-        }))
-        : [createElement('div', { className: 'poe2-affix-empty', textContent: '空条件组' })];
-      return createElement('div', {
-        className: `poe2-affix-group-card${groupIndex === selectedIndex ? ' active' : ''}`,
-        onClick: (event) => {
-          if (event.target.closest('button,input,label')) return;
-          groupSelect.value = String(groupIndex);
-          renderCraftAdvancedFilterConditionBuilder();
-        },
-        children: [
-          createElement('div', {
-            className: 'poe2-affix-group-head',
-            children: [
-              createElement('strong', { textContent: getCraftAdvancedFilterGroupLabel(groupIndex) }),
-              createElement('label', {
-                className: 'poe2-affix-min-field',
-                children: [
-                  createElement('span', { textContent: '本组命中数' }),
-                  minInput,
-                ],
-              }),
-              createButton('删除组', () => {
-                if (state.craftAdvancedFilterConditionGroups.length <= 1) {
-                  state.craftAdvancedFilterConditionGroups = [createEmptyAffixConditionGroup()];
-                } else {
-                  state.craftAdvancedFilterConditionGroups.splice(groupIndex, 1);
-                }
-                invalidateCraftLockedEquipmentResults();
-                renderCraftAdvancedFilterConditionBuilder();
-              }),
-            ],
-          }),
-          createElement('div', { className: 'poe2-affix-chip-list', children: conditionElements }),
-        ],
-      });
-    }));
-  };
-
-  const addCraftAdvancedFilterAffixConditions = (selectedOptions) => {
-    if (state.ui.craftAdvancedFilterCorruptedBaseSelect?.value === 'specific') {
-      addLog('具体腐化基底会直接参与筛选，无需添加到普通词缀条件组。', 'compact');
-      return;
-    }
-    const selectedAffixType = String(state.ui.craftAdvancedFilterAffixTypeSelect?.value || '').trim();
-    const cleanConditions = selectedOptions.map((option) => normalizeAffixCondition({
-      name: option?.value || option,
-      affixType: option?.dataset?.affixType || selectedAffixType,
-      affixId: option?.dataset?.affixId,
-      craftId: option?.dataset?.craftId,
-    })).filter((condition) => condition.name || condition.craftId);
-    if (!cleanConditions.length) {
-      addLog('请先选择一个或多个高级筛选详细词缀。', 'warn');
-      return;
-    }
-    const groupIndex = getActiveCraftAdvancedFilterGroupIndex();
-    const currentGroup = normalizeAffixConditionGroup(state.craftAdvancedFilterConditionGroups[groupIndex]);
-    const seenKeys = new Set();
-    currentGroup.conditions = [...currentGroup.conditions, ...cleanConditions]
-      .map(normalizeAffixCondition)
-      .filter((condition) => {
-        const key = getAffixConditionKey(condition);
-        if (!condition.name || seenKeys.has(key)) return false;
-        seenKeys.add(key);
-        return true;
-      });
-    state.craftAdvancedFilterConditionGroups[groupIndex] = currentGroup;
-    invalidateCraftLockedEquipmentResults();
-    renderCraftAdvancedFilterConditionBuilder();
-  };
-
-  const refreshCraftAdvancedFilterPositionSelect = () => {
-    const equipmentType = state.ui.craftAdvancedFilterEquipmentSelect?.value || '';
-    setSelectOptions(state.ui.craftAdvancedFilterPositionSelect, getAffixPositionOptions(equipmentType), '选择词缀位置');
-    setSelectOptions(state.ui.craftAdvancedFilterAffixTypeSelect, [], '选择词缀类型');
-    refreshCraftAdvancedFilterDetailSelect();
-  };
-
-  const refreshCraftAdvancedFilterAffixTypeSelect = () => {
-    const equipmentType = state.ui.craftAdvancedFilterEquipmentSelect?.value || '';
-    const position = state.ui.craftAdvancedFilterPositionSelect?.value || '';
-    setSelectOptions(state.ui.craftAdvancedFilterAffixTypeSelect, getAffixTypeOptions(equipmentType, position), '选择词缀类型');
-    refreshCraftAdvancedFilterDetailSelect();
-  };
-
-  const refreshCraftAdvancedFilterAffixTierSelect = () => {
-    const selectedOption = state.ui.craftAdvancedFilterAffixTypeSelect?.selectedOptions?.[0];
-    const affixTypeName = state.ui.craftAdvancedFilterAffixTypeSelect?.value || '';
-    const tierOptions = getAffixTierOptions(
-      affixTypeName,
-      Number(selectedOption?.dataset?.maxLevel || 0),
-      state.ui.craftAdvancedFilterEquipmentSelect?.value || '',
-      state.ui.craftAdvancedFilterPositionSelect?.value || '',
-    );
-    setSelectOptions(state.ui.craftAdvancedFilterAffixTierSelect, tierOptions, '选择详细词缀');
-  };
-
-  const getCraftAdvancedFilterCorruptedMagicOptions = () => {
-    const equipmentType = state.ui.craftAdvancedFilterEquipmentSelect?.value || '';
-    return getUniqueCraftCorruptedMagicSelectableOptionsForItem(equipmentType ? { equipmentType } : null)
-      .map((option) => ({
-        value: option.id,
-        label: option.label,
-        meta: {
-          corruptedMagicId: option.magicId,
-          corruptedMagicTier: option.tierKey,
-        },
-      }));
-  };
-
-  const refreshCraftAdvancedFilterDetailSelect = () => {
-    const isSpecificCorruptedBase = state.ui.craftAdvancedFilterCorruptedBaseSelect?.value === 'specific';
-    if (state.ui.craftAdvancedFilterDetailLabel) {
-      state.ui.craftAdvancedFilterDetailLabel.textContent = isSpecificCorruptedBase ? '具体腐化基底' : '具体词缀';
-    }
-    if (state.ui.craftAdvancedFilterPositionSelect) {
-      state.ui.craftAdvancedFilterPositionSelect.disabled = false;
-    }
-    if (state.ui.craftAdvancedFilterAffixTypeSelect) {
-      state.ui.craftAdvancedFilterAffixTypeSelect.disabled = false;
-    }
-    if (state.ui.craftAdvancedFilterAddConditionButton) {
-      state.ui.craftAdvancedFilterAddConditionButton.disabled = isSpecificCorruptedBase;
-      state.ui.craftAdvancedFilterAddConditionButton.textContent = isSpecificCorruptedBase ? '腐化基底直接参与筛选' : '添加条件';
-    }
-    if (isSpecificCorruptedBase) {
-      setSelectOptions(
-        state.ui.craftAdvancedFilterAffixTierSelect,
-        getCraftAdvancedFilterCorruptedMagicOptions(),
-        '选择具体腐化基底',
-      );
-      return;
-    }
-    refreshCraftAdvancedFilterAffixTierSelect();
-  };
-
-  const switchCraftAdvancedFilterToAffixDetail = () => {
-    if (state.ui.craftAdvancedFilterCorruptedBaseSelect?.value !== 'specific') return false;
-    state.ui.craftAdvancedFilterCorruptedBaseSelect.value = 'any';
-    invalidateCraftLockedEquipmentResults();
-    refreshCraftAdvancedFilterDetailSelect();
-    return true;
-  };
-
-  const readCraftAdvancedFilterOptions = () => {
-    const targetCount = Math.max(1, Number.parseInt(state.ui.targetCountInput?.value, 10) || 1);
-    const rarityValue = state.ui.raritySelect?.value;
-    const rarity = rarityValue === RARITY_TYPES.any ? RARITY_TYPES.any : Number.parseInt(rarityValue, 10);
-    const equipmentType = state.ui.craftAdvancedFilterEquipmentSelect?.value || '';
-    const corruptedBase = state.ui.craftAdvancedFilterCorruptedBaseSelect?.value || 'any';
-    const corruptedMagicIds = corruptedBase === 'specific'
-      ? Array.from(state.ui.craftAdvancedFilterAffixTierSelect?.selectedOptions || [])
-        .map((option) => String(option.value || '').trim())
-        .filter(Boolean)
-      : [];
-    if (corruptedBase === 'specific' && !corruptedMagicIds.length) {
-      throw new Error('选择“指定腐化基底”后，请在第三行选择至少一个具体腐化基底。');
-    }
-    return {
-      location: state.useStorage ? 'storage' : 'backpack',
-      keyword: String(state.ui.keywordInput?.value || '').trim(),
-      rarity,
-      targetCount,
-      equipmentType,
-      equipmentTypeMask: getAffixPickerEquipmentMask(equipmentType),
-      corrupted: state.ui.craftAdvancedFilterCorruptedSelect?.value || 'any',
-      corruptedBase,
-      corruptedMagicIds,
-      affixMatchMode: state.ui.craftAdvancedFilterAffixMatchSelect?.value || 'include',
-      affixConditionGroups: snapshotAffixConditionGroups(state.craftAdvancedFilterConditionGroups),
-    };
-  };
-
-  const scanAndLockCraftAdvancedFilterResults = async () => {
-    const options = readCraftAdvancedFilterOptions();
-    const scanRevision = state.craftAdvancedFilterRevision;
-    state.craftAdvancedFilterLocked = false;
-    state.craftLockedEquipmentResults = [];
-    setCraftAdvancedFilterSummary('正在扫描并锁定装备...');
-    const firstPage = await fetchEquipmentFilterPage({
-      page: 1,
-      location: options.location,
-      keyword: options.keyword,
-      rarity: options.rarity,
-    });
-    const totalPages = Math.max(1, Math.ceil(firstPage.total / firstPage.pageSize));
-    const summaryCandidates = [];
-    for (let page = 1; state.isRunning && page <= totalPages; page += 1) {
-      const pageResult = page === 1 ? firstPage : await fetchEquipmentFilterPage({
-        page,
-        location: options.location,
-        keyword: options.keyword,
-        rarity: options.rarity,
-      });
-      summaryCandidates.push(...pageResult.items
-        .map(normalizeEquipment)
-        .filter((equipment) => equipment.id)
-        .filter((equipment) => isEquipmentFilterSummaryMatched(equipment, options)));
-      setCraftAdvancedFilterSummary(`正在扫描：第 ${page}/${totalPages} 页，初筛 ${summaryCandidates.length} 件。`);
-    }
-    if (!state.isRunning) {
-      invalidateCraftLockedEquipmentResults('扫描已停止，没有锁定部分结果。');
-      return;
-    }
-    const needsDetail = options.affixConditionGroups.some((group) => group.conditions.length)
-      || options.corruptedBase !== 'any';
-    const detailResults = needsDetail
-      ? await runConcurrentTasks(summaryCandidates, EQUIPMENT_FILTER_CONFIG.detailConcurrency, async (equipment) => {
-        const detail = await fetchEquipmentDetail(equipment.id);
-        const detailedEquipment = normalizeEquipment({
-          ...equipment,
-          ...(detail || {}),
-          id: detail?.id || equipment.id,
-          assistantSourceLocation: equipment.assistantSourceLocation,
-        });
-        return isEquipmentFilterDetailMatched(detailedEquipment, options) ? detailedEquipment : null;
-      })
-      : summaryCandidates;
-    const matchedResults = detailResults
-      .filter((result) => result && !result.error && result.id)
-      .slice(0, options.targetCount);
-    if (scanRevision !== state.craftAdvancedFilterRevision) {
-      invalidateCraftLockedEquipmentResults('扫描期间筛选条件发生变化，本次结果没有锁定，请重新扫描。');
-      return;
-    }
-    state.craftLockedEquipmentResults = matchedResults;
-    state.craftAdvancedFilterLocked = true;
-    state.ui.craftAdvancedFilterScanButton.textContent = '重新扫描并锁定结果';
-    setCraftAdvancedFilterSummary(`已锁定 ${matchedResults.length} 件装备；后续公共打造只会处理这些装备 ID。`);
-    addLog(`打造装备高级筛选完成：扫描 ${firstPage.total} 件，初筛 ${summaryCandidates.length} 件，锁定 ${matchedResults.length} 件。`, 'success');
-  };
-
   const getCurrentEquipmentFilterResults = () => (state.equipmentFilterResults || [])
     .filter((equipment) => equipment?.id);
 
@@ -21971,6 +21754,33 @@
     addLog(`最小化时暂停脚本已${state.minimizePausesAutomation ? '开启' : '关闭'}。`, 'compact');
   };
 
+  const updateAffixDisplayButtons = () => {
+    if (state.ui.showAffixWeightsButton) {
+      state.ui.showAffixWeightsButton.textContent = `显示词缀权重：${state.showAffixWeights ? '开' : '关'}`;
+      state.ui.showAffixWeightsButton.classList.toggle('poe2-toggle-active', state.showAffixWeights);
+    }
+    if (state.ui.showAffixTypesButton) {
+      state.ui.showAffixTypesButton.textContent = `显示词缀 types：${state.showAffixTypes ? '开' : '关'}`;
+      state.ui.showAffixTypesButton.classList.toggle('poe2-toggle-active', state.showAffixTypes);
+    }
+  };
+
+  const toggleAffixWeightsDisplay = () => {
+    state.showAffixWeights = !state.showAffixWeights;
+    updateAssistantSetting('showAffixWeights', state.showAffixWeights);
+    updateAffixDisplayButtons();
+    refreshCustomAffixTierDisplay();
+    addLog(`自定义打造词缀权重显示已${state.showAffixWeights ? '开启' : '关闭'}。`, 'compact');
+  };
+
+  const toggleAffixTypesDisplay = () => {
+    state.showAffixTypes = !state.showAffixTypes;
+    updateAssistantSetting('showAffixTypes', state.showAffixTypes);
+    updateAffixDisplayButtons();
+    refreshCustomAffixTierDisplay();
+    addLog(`自定义打造词缀 types 显示已${state.showAffixTypes ? '开启' : '关闭'}。`, 'compact');
+  };
+
   /**
    * updateStepActionSafetyLimit 更新步骤动作安全上限，并立即影响后续打造任务。
    */
@@ -22188,6 +21998,81 @@
       }
       selectElement.append(optionElement);
     }
+    if (typeof selectElement.syncCustomOptions === 'function') selectElement.syncCustomOptions();
+  };
+
+  const createAffixTierMultiSelect = () => {
+    const selectElement = createSelect([], '');
+    selectElement.multiple = true;
+    selectElement.hidden = true;
+    const optionList = createElement('div', { className: 'poe2-affix-tier-options' });
+    optionList.setAttribute('role', 'listbox');
+    optionList.setAttribute('aria-multiselectable', 'true');
+    const root = createElement('div', {
+      className: 'poe2-affix-tier-multiselect',
+      children: [optionList, selectElement],
+    });
+    let syncScheduled = false;
+    const renderCustomOptions = () => {
+      syncScheduled = false;
+      const options = Array.from(selectElement.options || []).filter((option) => option.value);
+      optionList.replaceChildren(...(options.length ? options.map((option) => {
+        const optionIndex = Array.prototype.indexOf.call(selectElement.options, option);
+        const optionElement = createElement('div', {
+          className: `poe2-affix-tier-option${option.selected ? ' selected' : ''}`,
+          dataset: { optionIndex },
+          children: [createElement('span', { textContent: option.textContent })],
+        });
+        optionElement.setAttribute('role', 'option');
+        optionElement.tabIndex = 0;
+        optionElement.setAttribute('aria-selected', String(option.selected));
+        return optionElement;
+      }) : [createElement('div', {
+        className: 'poe2-affix-tier-placeholder',
+        textContent: selectElement.options?.[0]?.textContent || '选择词缀等级',
+      })]));
+    };
+    const syncCustomOptions = () => {
+      if (syncScheduled) return;
+      syncScheduled = true;
+      queueMicrotask(renderCustomOptions);
+    };
+    const toggleCustomOption = (optionElement) => {
+      if (selectElement.disabled) return;
+      const option = selectElement.options[Number(optionElement?.dataset?.optionIndex)];
+      if (!option) return;
+      option.selected = !option.selected;
+      optionElement.classList.toggle('selected', option.selected);
+      optionElement.setAttribute('aria-selected', String(option.selected));
+      selectElement.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    optionList.addEventListener('click', (event) => {
+      toggleCustomOption(event.target.closest('.poe2-affix-tier-option[data-option-index]'));
+    });
+    optionList.addEventListener('keydown', (event) => {
+      if ((event.ctrlKey || event.metaKey) && String(event.key || '').toLowerCase() === 'a') {
+        if (selectElement.disabled) return;
+        event.preventDefault();
+        Array.from(selectElement.options || []).forEach((option) => {
+          if (option.value) option.selected = true;
+        });
+        optionList.querySelectorAll('.poe2-affix-tier-option[data-option-index]').forEach((optionElement) => {
+          optionElement.classList.add('selected');
+          optionElement.setAttribute('aria-selected', 'true');
+        });
+        selectElement.dispatchEvent(new Event('change', { bubbles: true }));
+        return;
+      }
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      const optionElement = event.target.closest('.poe2-affix-tier-option[data-option-index]');
+      if (!optionElement) return;
+      event.preventDefault();
+      toggleCustomOption(optionElement);
+    });
+    selectElement.syncCustomOptions = syncCustomOptions;
+    root.affixTierSelect = selectElement;
+    syncCustomOptions();
+    return root;
   };
 
   const UNIQUE_CRAFT_START_MODE_OPTIONS = [
@@ -24457,15 +24342,31 @@
     return Number.isFinite(weight) && weight >= 0 ? weight : null;
   };
 
+  const AFFIX_RELATION_TOTAL_WEIGHT_CACHE = new WeakMap();
+
   const getTotalAffixWeightForPosition = (equipmentType, affixPosition) => {
     const affixes = AFFIX_EQUIPMENT_DATA[equipmentType]?.[affixPosition];
     if (!Array.isArray(affixes)) return 0;
     return affixes.reduce((total, relation) => {
       if (!relation?.name) return total;
-      return total + getAffixRelationTiers(relation).reduce((tierTotal, tier) => (
-        tierTotal + (getAffixTierWeight(equipmentType, tier) || 0)
-      ), 0);
+      return total + getTotalAffixWeightForRelation(equipmentType, relation);
     }, 0);
+  };
+
+  const getTotalAffixWeightForRelation = (equipmentType, relation) => {
+    if (!relation?.name) return 0;
+    let equipmentWeightCache = AFFIX_RELATION_TOTAL_WEIGHT_CACHE.get(relation);
+    if (!equipmentWeightCache) {
+      equipmentWeightCache = new Map();
+      AFFIX_RELATION_TOTAL_WEIGHT_CACHE.set(relation, equipmentWeightCache);
+    }
+    const cacheKey = String(equipmentType || '');
+    if (equipmentWeightCache.has(cacheKey)) return equipmentWeightCache.get(cacheKey);
+    const totalWeight = getAffixRelationTiers(relation).reduce((total, tier) => (
+      total + (getAffixTierWeight(equipmentType, tier) || 0)
+    ), 0);
+    equipmentWeightCache.set(cacheKey, totalWeight);
+    return totalWeight;
   };
 
   const getAffixPositionOptions = (equipmentType, includeCorruptedBase = false) => {
@@ -24591,7 +24492,7 @@
    * @param {string} affixPosition 词缀位置。
    * @returns {Array<object>} 词缀类型下拉选项。
    */
-  const getAffixTypeOptions = (equipmentType, affixPosition) => {
+  const getAffixTypeOptions = (equipmentType, affixPosition, displayOptions = {}) => {
     if (affixPosition === '基底') {
       return getUniqueCraftCorruptedMagicOptionsForItem({ equipmentType }).length
         ? [{
@@ -24605,11 +24506,15 @@
     if (!Array.isArray(affixes)) return [];
     const options = affixes
       .filter((affix) => affix?.name)
-      .map((affix) => ({
-        value: affix.name,
-        label: formatFlaskAffixDisplayText(equipmentType, affix.displayName || affix.name),
-        meta: { maxLevel: Number(affix.maxLevel || 0) },
-      }));
+      .map((affix) => {
+        const displayName = formatFlaskAffixDisplayText(equipmentType, affix.displayName || affix.name);
+        const totalWeight = getTotalAffixWeightForRelation(equipmentType, affix);
+        return {
+          value: affix.name,
+          label: `${displayName}${displayOptions.showWeights === true && totalWeight ? `(${totalWeight})` : ''}`,
+          meta: { maxLevel: Number(affix.maxLevel || 0), totalWeight },
+        };
+      });
     if (getCraftBenchAffixesForPicker(equipmentType, affixPosition).length) {
       options.push({ value: CRAFT_AFFIX_TYPE_NAME, label: CRAFT_AFFIX_TYPE_NAME, meta: { maxLevel: 0, crafted: true } });
     }
@@ -24642,6 +24547,26 @@
     return formatFlaskAffixDisplayText(equipmentType, tier?.value);
   };
 
+  const formatAffixTierOptionLabel = ({
+    displayName,
+    requiredLevel,
+    weight,
+    effectText,
+    extraText = '',
+    types = [],
+    showWeights = true,
+    showTypes = false,
+  }) => {
+    const prefix = `${displayName}${requiredLevel === null ? '' : `[${requiredLevel}]`}${showWeights && weight !== null ? `(${weight})` : ''}: `;
+    const continuationIndentWidth = [...prefix].reduce((width, character) => (
+      width + (/^[\u0000-\u00ff]$/.test(character) ? 1 : 2)
+    ), 0);
+    const continuationIndent = ' '.repeat(continuationIndentWidth);
+    const indentedEffectText = String(effectText || '').replace(/\r?\n/g, `\n${continuationIndent}`);
+    const typesText = showTypes && Array.isArray(types) && types.length ? `{${types.join(',')}}` : '';
+    return `${prefix}${indentedEffectText}${extraText}${typesText}`;
+  };
+
   /**
    * getAffixTierOptions 根据词缀类型和最高阶级返回具体可选词缀名。
    * 做装插件的原逻辑是倒序显示，并过滤超过 maxLevel 的等阶。
@@ -24649,7 +24574,7 @@
    * @param {number} maxLevel 当前装备类型允许的最高阶级。
    * @returns {Array<object>} 具体词缀等级下拉选项。
    */
-  const getAffixTierOptions = (affixTypeName, maxLevel, equipmentType = '', affixPosition = '') => {
+  const getAffixTierOptions = (affixTypeName, maxLevel, equipmentType = '', affixPosition = '', displayOptions = {}) => {
     if (affixPosition === '基底' && affixTypeName === CORRUPTED_BASE_AFFIX_TYPE_NAME) {
       return getUniqueCraftCorruptedMagicSelectableOptionsForItem({ equipmentType }).map((option) => ({
         value: option.label,
@@ -24696,7 +24621,16 @@
         const sameNameQualifierLabel = sameNameQualifier ? `（${sameNameQualifier}）` : '';
         return {
           value: tier.name,
-          label: `${displayName}${requiredLevel === null ? '' : `[${requiredLevel}]`}${weight === null ? '' : `(${weight})`}: ${formatAffixTierEffectText(equipmentType, tier)}${isOutdatedFlaskEffectTier(affixTypeName, tier) ? '（已过时）' : ''}${aliasLabel}${sameNameQualifierLabel}`,
+          label: formatAffixTierOptionLabel({
+            displayName,
+            requiredLevel,
+            weight,
+            effectText: formatAffixTierEffectText(equipmentType, tier),
+            extraText: `${isOutdatedFlaskEffectTier(affixTypeName, tier) ? '（已过时）' : ''}${aliasLabel}${sameNameQualifierLabel}`,
+            types: tier.types,
+            showWeights: displayOptions.showWeights !== false,
+            showTypes: displayOptions.showTypes === true,
+          }),
           meta: {
             level: Number(tier.level || 0),
             requiredLevel,
@@ -24755,14 +24689,25 @@
     Number.isInteger(stepIndex) && stepIndex >= stepCount ? '终止(打造成功)' : formatContinuousStepTarget(stepIndex)
   );
 
-  const formatContinuousStepEditableTargetLabel = (stepIndex, stepCount) => (
-    Number.isInteger(stepIndex) && stepIndex >= stepCount ? `${formatContinuousStepCode(stepCount)}（新增后）` : formatContinuousStepTarget(stepIndex)
-  );
+  const getContinuousStepRelativeLabel = (stepIndex, currentStepIndex) => {
+    if (!Number.isInteger(currentStepIndex)) return '';
+    const relativeOffset = stepIndex - currentStepIndex;
+    if (relativeOffset === 0) return '当前步';
+    if (relativeOffset === 1) return '下一步';
+    if (relativeOffset === 2) return '下两步';
+    return '';
+  };
 
-  const createContinuousStepTargetOptions = (stepCount) => [
+  const formatContinuousStepEditableTargetLabel = (stepIndex, stepCount, currentStepIndex = null) => {
+    if (Number.isInteger(stepIndex) && stepIndex >= stepCount) return `${formatContinuousStepCode(stepCount)}（新增后）`;
+    const relativeLabel = getContinuousStepRelativeLabel(stepIndex, currentStepIndex);
+    return `${formatContinuousStepTarget(stepIndex)}${relativeLabel ? `（${relativeLabel}）` : ''}`;
+  };
+
+  const createContinuousStepTargetOptions = (stepCount, currentStepIndex = null) => [
     ...Array.from({ length: stepCount }, (_, stepIndex) => ({
       value: String(stepIndex),
-      label: `步骤 ${formatContinuousStepCode(stepIndex)}`,
+      label: `步骤 ${formatContinuousStepEditableTargetLabel(stepIndex, stepCount, currentStepIndex)}`,
     })),
     { value: String(stepCount), label: `步骤 ${formatContinuousStepCode(stepCount)}（新增后）` },
   ];
@@ -24801,6 +24746,10 @@
     if (!state.affixConditionGroups.length) state.affixConditionGroups = [createEmptyAffixConditionGroup()];
     state.affixConditionGroups = state.affixConditionGroups.map(normalizeAffixConditionGroup);
     const selectedIndex = Math.min(getActiveAffixGroupIndex(), state.affixConditionGroups.length - 1);
+    const isMultiConditionStep = state.affixConditionContext?.mode === 'continuous'
+      && getActionFromContinuousActionControls() === 'multiConditionCheck';
+    const continuousSteps = isMultiConditionStep ? getContinuousCraftSteps() : [];
+    const activeStepIndex = isMultiConditionStep ? getActiveContinuousCraftStepIndex() : 0;
     groupSelect.replaceChildren(...state.affixConditionGroups.map((group, groupIndex) => {
       const conditions = group.conditions;
       const groupLabel = getAffixConditionGroupLabel(groupIndex);
@@ -24823,6 +24772,27 @@
       minInput.min = '1';
       minInput.max = String(Math.max(1, conditions.length));
       minInput.title = '本组至少命中几个条件。命中数不能小于 1，也不能超过本组条件数量。';
+      const nextStepSelect = isMultiConditionStep ? createSelect(
+        createContinuousStepTargetOptions(continuousSteps.length, activeStepIndex),
+        String(resolveContinuousStepTarget(group.nextStepIndex, activeStepIndex + 1, continuousSteps.length)),
+      ) : null;
+      if (nextStepSelect) {
+        nextStepSelect.classList.add('poe2-affix-group-route-select');
+        nextStepSelect.title = '该条件组命中后进入的步骤；多个条件组同时命中时，按从上到下第一个命中的组执行。';
+        nextStepSelect.addEventListener('change', () => {
+          const currentGroup = normalizeAffixConditionGroup(state.affixConditionGroups[groupIndex]);
+          state.affixConditionGroups[groupIndex] = {
+            ...currentGroup,
+            nextStepIndex: readContinuousStepTargetSelectValue(
+              nextStepSelect,
+              activeStepIndex + 1,
+              continuousSteps.length,
+            ),
+          };
+          saveCurrentContinuousStepSilently();
+          renderContinuousCraftSteps();
+        });
+      }
       const conditionElements = conditions.length
         ? conditions.map((condition, affixIndex) => createElement('button', {
           className: 'poe2-affix-chip',
@@ -24833,7 +24803,7 @@
       return createElement('div', {
         className: `poe2-affix-group-card${groupIndex === selectedIndex ? ' active' : ''}`,
         onClick: (event) => {
-          if (event.target.closest('button,input,label')) return;
+          if (event.target.closest('button,input,label,select')) return;
           state.ui.affixGroupSelect.value = String(groupIndex);
           renderAffixConditionBuilder();
         },
@@ -24849,8 +24819,14 @@
                   minInput,
                 ],
               }),
+              ...(nextStepSelect ? [createElement('label', {
+                className: 'poe2-affix-min-field',
+                children: [
+                  createElement('span', { textContent: '命中后' }),
+                  nextStepSelect,
+                ],
+              })] : []),
               createButton('复制组', () => copyAffixConditionGroup(groupIndex)),
-              createButton('粘贴组', () => pasteAffixConditionGroup(groupIndex)),
               createButton('删除组', () => removeAffixGroup(groupIndex)),
             ],
           }),
@@ -24919,30 +24895,36 @@
     const sourceGroup = normalizeAffixConditionGroup(state.affixConditionGroups[groupIndex]);
     state.affixConditionGroupClipboard = {
       minRequired: sourceGroup.minRequired,
+      nextStepIndex: sourceGroup.nextStepIndex,
       conditions: sourceGroup.conditions.map((condition) => normalizeAffixCondition(condition)),
     };
     addLog(`已复制条件组 ${getAffixConditionGroupLabel(groupIndex)}（${sourceGroup.conditions.length} 条条件）。`, 'compact');
   };
 
   /**
-   * pasteAffixConditionGroup 把运行时剪贴板作为新条件组插入指定组之后。
+   * pasteAffixConditionGroup 把运行时剪贴板作为新条件组粘贴到指定组之后；未指定位置时追加到末尾。
+   * 如果编辑器当前只有一个空占位组，粘贴前先移除占位组，避免多出无意义的空条件组。
    * 每次粘贴都会重新生成条件对象，后续修改副本不会影响剪贴板或原条件组。
-   * @param {number} groupIndex 在哪个条件组后插入。
+   * @param {number|null} groupIndex 在哪个条件组后插入；null 表示追加到末尾。
    */
-  const pasteAffixConditionGroup = (groupIndex) => {
+  const pasteAffixConditionGroup = (groupIndex = null) => {
     if (!state.affixConditionGroupClipboard) {
       addLog('条件组剪贴板为空，请先复制一个条件组。', 'warn');
       return;
     }
+    const hasSingleEmptyPlaceholder = state.affixConditionGroups.length === 1
+      && normalizeAffixConditionGroup(state.affixConditionGroups[0]).conditions.length === 0;
+    if (hasSingleEmptyPlaceholder) state.affixConditionGroups = [];
     const copiedGroup = normalizeAffixConditionGroup(state.affixConditionGroupClipboard);
     const pastedGroup = {
       minRequired: copiedGroup.minRequired,
+      nextStepIndex: copiedGroup.nextStepIndex,
       conditions: copiedGroup.conditions.map((condition) => normalizeAffixCondition(condition)),
     };
-    const insertIndex = Math.min(
-      Math.max(0, Number.parseInt(groupIndex, 10) + 1),
-      state.affixConditionGroups.length,
-    );
+    const parsedGroupIndex = Number.parseInt(groupIndex, 10);
+    const insertIndex = Number.isInteger(parsedGroupIndex)
+      ? Math.min(Math.max(0, parsedGroupIndex + 1), state.affixConditionGroups.length)
+      : state.affixConditionGroups.length;
     state.affixConditionGroups.splice(insertIndex, 0, pastedGroup);
     state.ui.affixGroupSelect.value = String(insertIndex);
     renderAffixConditionBuilder();
@@ -25044,14 +25026,6 @@
   };
 
   /**
-   * clearAffixConditions 清空所有可视化词缀条件。
-   */
-  const clearAffixConditions = () => {
-    state.affixConditionGroups = [createEmptyAffixConditionGroup()];
-    renderAffixConditionBuilder();
-  };
-
-  /**
    * getActiveContinuousCraftStepIndex 返回当前正在编辑的连续打造步骤下标。
    * @returns {number} 可安全访问 state.continuousCraftSteps 的下标。
    */
@@ -25062,14 +25036,14 @@
     return Math.min(rawIndex, steps.length - 1);
   };
 
-  const isContinuousConditionAction = (action) => action === 'conditionCheck';
+  const isContinuousConditionAction = (action) => ['conditionCheck', 'multiConditionCheck'].includes(action);
 
   const getContinuousActionKind = (action) => {
     if (action === 'craftBench') return 'craftBench';
     if (action === 'gardenCraft') return 'gardenCraft';
     if (action === 'catalyst') return 'catalyst';
     if (['ensureMagic', 'ensureRare', 'smartAugment', 'smartExalted', 'smartCraftBench'].includes(action)) return 'aggregate';
-    if (action === 'conditionCheck') return 'condition';
+    if (isContinuousConditionAction(action)) return 'condition';
     if (action === 'none') return 'none';
     return 'currency';
   };
@@ -25086,7 +25060,10 @@
     if (kind === 'craftBench') return 'craftBench';
     if (kind === 'gardenCraft') return 'gardenCraft';
     if (kind === 'catalyst') return 'catalyst';
-    if (kind === 'condition') return 'conditionCheck';
+    if (kind === 'condition') {
+      const selectedAction = state.ui.continuousActionSelect?.value;
+      return CONTINUOUS_ACTION_KIND_DETAIL_OPTIONS.condition.includes(selectedAction) ? selectedAction : 'conditionCheck';
+    }
     if (kind === 'none') return 'none';
     const selectedAction = state.ui.continuousActionSelect?.value;
     const validActions = CONTINUOUS_ACTION_KIND_DETAIL_OPTIONS[kind] || [];
@@ -25110,8 +25087,12 @@
   const updateContinuousHandlingTargetVisibility = () => {
     const currentAction = getActionFromContinuousActionControls();
     const isConditionAction = isContinuousConditionAction(currentAction);
+    const isMultiConditionAction = currentAction === 'multiConditionCheck';
+    if (state.ui.continuousMultiConditionSuccessField) {
+      state.ui.continuousMultiConditionSuccessField.hidden = !isMultiConditionAction;
+    }
     if (state.ui.continuousSuccessHandlingField) {
-      state.ui.continuousSuccessHandlingField.hidden = false;
+      state.ui.continuousSuccessHandlingField.hidden = isMultiConditionAction;
       const labelElement = state.ui.continuousSuccessHandlingField.querySelector('span');
       if (labelElement) labelElement.textContent = isConditionAction ? '条件成立' : '完成后';
     }
@@ -25119,7 +25100,7 @@
       state.ui.continuousFailureHandlingField.hidden = !isConditionAction;
     }
     if (state.ui.continuousSuccessTargetField) {
-      state.ui.continuousSuccessTargetField.hidden = state.ui.continuousSuccessSelect?.value !== 'jump';
+      state.ui.continuousSuccessTargetField.hidden = isMultiConditionAction || state.ui.continuousSuccessSelect?.value !== 'jump';
       const labelElement = state.ui.continuousSuccessTargetField.querySelector('span');
       if (labelElement) labelElement.textContent = isConditionAction ? '成立跳转步骤' : '下一步';
     }
@@ -25173,11 +25154,11 @@
     const isCatalystAction = getActionFromContinuousActionControls() === 'catalyst';
     const categoryValue = isCatalystAction ? 'jewelry' : state.ui.continuousGardenCategorySelect.value;
     if (isCatalystAction) await ensureCatalystList(categoryValue);
-    else await ensureGardenCraftList(categoryValue);
+    else await ensureGardenAndCatalystStartupData();
     const selectedGardenCraftKey = preferredGardenCraftKey || state.ui.continuousGardenCraftSelect.value;
     const options = isCatalystAction
       ? getCatalystOptionsByCategory(categoryValue)
-      : getGardenCraftOptionsByCategory(categoryValue);
+      : getCustomGardenCraftOptionsByCategory(categoryValue);
     setSelectOptions(state.ui.continuousGardenCraftSelect, options, isCatalystAction ? '选择催化剂' : '选择花园工艺方法');
     if (options.some((option) => String(option.value) === String(selectedGardenCraftKey))) {
       state.ui.continuousGardenCraftSelect.value = selectedGardenCraftKey;
@@ -25203,7 +25184,10 @@
     state.activeContinuousStepIndex = activeIndex;
     state.ui.continuousStepSelect.replaceChildren(...steps.map((step, stepIndex) => {
       const actionConfig = CONTINUOUS_CRAFT_ACTIONS[step.action];
-      const effectiveGroups = step.conditionGroups.filter((group) => group.conditions.length > 0);
+      const effectiveGroupEntries = step.conditionGroups
+        .map((group, groupIndex) => ({ group, groupIndex }))
+        .filter((entry) => entry.group.conditions.length > 0);
+      const effectiveGroups = effectiveGroupEntries.map((entry) => entry.group);
       const usesCraftBenchSelection = ['craftBench', 'smartCraftBench'].includes(step.action);
       const usesGardenCraftSelection = ['gardenCraft', 'catalyst'].includes(step.action);
       const craft = usesCraftBenchSelection ? getCraftBenchById(step.craftId) : null;
@@ -25215,8 +25199,8 @@
           ? `：${(gardenCraft || catalyst)?.label || (step.gardenCraftKey ? `${step.action === 'catalyst' ? '催化剂' : '花园工艺'} ${step.gardenCraftKey}` : `未选择${step.action === 'catalyst' ? '催化剂' : '花园工艺'}`)}`
         : '';
       const stepCode = formatContinuousStepCode(stepIndex);
-      const groupText = step.action === 'conditionCheck' ? `（${effectiveGroups.length} 组）` : '';
-      const actionLabel = step.action === 'conditionCheck'
+      const groupText = isContinuousConditionAction(step.action) ? `（${effectiveGroups.length} 组）` : '';
+      const actionLabel = isContinuousConditionAction(step.action)
         ? `${actionConfig.label}(${formatConditionStepShortLabel(effectiveGroups)})`
         : actionConfig.label;
       const option = createElement('option', {
@@ -25227,7 +25211,7 @@
       return option;
     }));
     syncContinuousActionControls(steps[activeIndex].action);
-    const targetOptions = createContinuousStepTargetOptions(steps.length);
+    const targetOptions = createContinuousStepTargetOptions(steps.length, activeIndex);
     setSelectOptions(state.ui.continuousSuccessTargetInput, targetOptions);
     setSelectOptions(state.ui.continuousFailureTargetInput, targetOptions);
     if (state.ui.continuousSuccessSelect) {
@@ -25265,7 +25249,10 @@
       const actionConfig = CONTINUOUS_CRAFT_ACTIONS[step.action];
       const successConfig = CONTINUOUS_STEP_HANDLINGS[step.successHandling];
       const failureConfig = CONTINUOUS_STEP_HANDLINGS[step.failureHandling];
-      const effectiveGroups = step.conditionGroups.filter((group) => group.conditions.length > 0);
+      const effectiveGroupEntries = step.conditionGroups
+        .map((group, groupIndex) => ({ group, groupIndex }))
+        .filter((entry) => entry.group.conditions.length > 0);
+      const effectiveGroups = effectiveGroupEntries.map((entry) => entry.group);
       const usesCraftBenchSelection = ['craftBench', 'smartCraftBench'].includes(step.action);
       const usesGardenCraftSelection = ['gardenCraft', 'catalyst'].includes(step.action);
       const craft = usesCraftBenchSelection ? getCraftBenchById(step.craftId) : null;
@@ -25273,12 +25260,13 @@
       const catalyst = step.action === 'catalyst' ? findLoadedCatalystByKey(step.gardenCraftKey) : null;
       const stepCode = formatContinuousStepCode(stepIndex);
       const successText = step.successHandling === 'jump'
-        ? `条件成立跳转步骤${formatContinuousStepEditableTargetLabel(step.successTargetStepIndex ?? stepIndex + 1, steps.length)}`
+        ? `条件成立跳转步骤${formatContinuousStepEditableTargetLabel(step.successTargetStepIndex ?? stepIndex + 1, steps.length, stepIndex)}`
         : `条件成立${successConfig.label}`;
       const failureText = step.failureHandling === 'jump'
-        ? `条件不成立跳转步骤${formatContinuousStepEditableTargetLabel(step.failureTargetStepIndex, steps.length)}`
+        ? `条件不成立跳转步骤${formatContinuousStepEditableTargetLabel(step.failureTargetStepIndex, steps.length, stepIndex)}`
         : `条件不成立${failureConfig.label}`;
-      const isConditionStep = step.action === 'conditionCheck';
+      const isConditionStep = isContinuousConditionAction(step.action);
+      const isMultiConditionStep = step.action === 'multiConditionCheck';
       const actionLabel = isConditionStep
         ? `${actionConfig.label}(${formatConditionStepShortLabel(effectiveGroups)})`
         : actionConfig.label;
@@ -25294,10 +25282,21 @@
                 : ''
       }`;
       const nextText = step.successHandling === 'jump'
-        ? `下一步${formatContinuousStepEditableTargetLabel(step.successTargetStepIndex ?? stepIndex + 1, steps.length)}`
+        ? `下一步${formatContinuousStepEditableTargetLabel(step.successTargetStepIndex ?? stepIndex + 1, steps.length, stepIndex)}`
         : `完成后${successConfig.label}`;
+      const multiConditionRouteText = isMultiConditionStep
+        ? effectiveGroupEntries.map(({ group, groupIndex }) => (
+          `${stepCode}-${groupIndex + 1}→${formatContinuousStepEditableTargetLabel(
+            group.nextStepIndex ?? stepIndex + 1,
+            steps.length,
+            stepIndex,
+          )}`
+        )).join('，')
+        : '';
       const summaryLines = [
-        isConditionStep
+        isMultiConditionStep
+          ? `步骤${stepCode} ${actionText} ${multiConditionRouteText}；均不成立${failureText.replace('条件不成立', '')}`
+          : isConditionStep
           ? `步骤${stepCode} ${actionText} ${successText} ${failureText}`
           : `步骤${stepCode} ${actionText} ${nextText}`,
       ];
@@ -25358,7 +25357,7 @@
     state.affixConditionGroups = step.conditionGroups.length
       ? step.conditionGroups.map(normalizeAffixConditionGroup)
       : [createEmptyAffixConditionGroup()];
-    const targetOptions = createContinuousStepTargetOptions(steps.length);
+    const targetOptions = createContinuousStepTargetOptions(steps.length, activeIndex);
     setSelectOptions(state.ui.continuousSuccessTargetInput, targetOptions);
     setSelectOptions(state.ui.continuousFailureTargetInput, targetOptions);
     syncContinuousActionControls(step.action);
@@ -25494,7 +25493,9 @@
     const previousTierValues = preserveSelection
       ? Array.from(state.ui.affixTierSelect.selectedOptions).map((option) => option.value)
       : [];
-    setSelectOptions(state.ui.affixTypeSelect, getAffixTypeOptions(equipmentType, affixPosition), '选择词缀类型');
+    setSelectOptions(state.ui.affixTypeSelect, getAffixTypeOptions(equipmentType, affixPosition, {
+      showWeights: state.showAffixWeights,
+    }), '选择词缀类型');
     setSelectOptions(state.ui.affixTierSelect, [], '选择词缀等级');
     if (
       affixPosition === '基底'
@@ -25511,6 +25512,7 @@
     Array.from(state.ui.affixTierSelect.options).forEach((option) => {
       option.selected = previousTierSet.has(option.value);
     });
+    state.ui.affixTierSelect.syncCustomOptions?.();
   };
 
   /**
@@ -25525,7 +25527,16 @@
       maxLevel,
       state.ui.affixEquipmentSelect.value,
       state.ui.affixPositionSelect.value,
+      {
+        showWeights: state.showAffixWeights,
+        showTypes: state.showAffixTypes && state.ui.affixPositionSelect.value !== '基底',
+      },
     ), '选择词缀等级');
+  };
+
+  const refreshCustomAffixTierDisplay = () => {
+    if (!state.ui.affixTierSelect || !state.ui.affixTypeSelect) return;
+    refreshAffixTypeSelect(true);
   };
 
   const getSpecialConditionMetricOptions = () => Object.entries(SPECIAL_CONDITION_METRICS)
@@ -25628,9 +25639,8 @@
     state.ui.affixEquipmentSelect = createSelect([], '');
     state.ui.affixPositionSelect = createSelect([], '');
     state.ui.affixTypeSelect = createSelect([], '');
-    state.ui.affixTierSelect = createSelect([], '');
-    state.ui.affixTierSelect.multiple = true;
-    state.ui.affixTierSelect.size = 4;
+    state.ui.affixTierControl = createAffixTierMultiSelect();
+    state.ui.affixTierSelect = state.ui.affixTierControl.affixTierSelect;
     state.ui.specialConditionMetricSelect = createSelect(getSpecialConditionMetricOptions(), 'totalAffixCount');
     state.ui.specialConditionOperatorSelect = createSelect([], '');
     state.ui.specialConditionValueControl = createElement('div', { className: 'poe2-special-value-control' });
@@ -25671,14 +25681,14 @@
       addAffixConditions(Array.from(state.ui.affixTierSelect.selectedOptions));
     });
     const addGroupButton = createButton('添加条件组', addAffixGroup);
-    const clearAffixButton = createButton('清空条件', clearAffixConditions);
+    const pasteGroupButton = createButton('粘贴条件组', () => pasteAffixConditionGroup());
     state.ui.affixConditionPanel = createElement('div', {
       className: 'poe2-grid poe2-affix-picker-grid poe2-wide',
       children: [
         createLabeledControl('装备类型', state.ui.affixEquipmentSelect),
         createLabeledControl('位置', state.ui.affixPositionSelect),
         createLabeledControl('词缀类型', state.ui.affixTypeSelect),
-        createLabeledControl('词缀等级', state.ui.affixTierSelect, 'poe2-affix-tier-field'),
+        createLabeledControl('词缀等级', state.ui.affixTierControl, 'poe2-affix-tier-field'),
       ],
     });
     state.ui.specialConditionPanel = createElement('div', {
@@ -25720,7 +25730,7 @@
             state.ui.rollConditionPanel,
             createElement('div', {
               className: 'poe2-actions poe2-affix-actions poe2-affix-picker-actions',
-              children: [addAffixButton, addGroupButton, clearAffixButton],
+              children: [addAffixButton, addGroupButton, pasteGroupButton],
             }),
           ],
         }),
@@ -26173,18 +26183,21 @@
   const createAssistantBehaviorSection = () => {
     const positionButton = createButton('调整位置', togglePositionAdjustMode);
     state.ui.minimizePauseButton = createButton('', toggleMinimizePauseMode);
+    state.ui.showAffixWeightsButton = createButton('', toggleAffixWeightsDisplay);
+    state.ui.showAffixTypesButton = createButton('', toggleAffixTypesDisplay);
     updateMinimizePauseButton();
+    updateAffixDisplayButtons();
     return createElement('div', {
       className: 'poe2-section',
       children: [
         createElement('div', { className: 'poe2-section-title', textContent: '助手行为' }),
         createElement('div', {
           className: 'poe2-summary',
-          textContent: '调整助手入口位置，并控制最小化时是否暂停自动化执行。',
+          textContent: '调整助手入口位置，并控制最小化暂停及自定义打造词缀等级的附属信息显示。',
         }),
         createElement('div', {
           className: 'poe2-actions poe2-affix-actions',
-          children: [positionButton, state.ui.minimizePauseButton],
+          children: [positionButton, state.ui.minimizePauseButton, state.ui.showAffixWeightsButton, state.ui.showAffixTypesButton],
         }),
       ],
     });
@@ -26920,8 +26933,9 @@
         className: 'poe2-help-panel',
         children: [
           createElement('div', { className: 'poe2-help-title', textContent: '条件组' }),
-          createElement('div', { className: 'poe2-help-line', textContent: '可建多个条件组。组之间是“或”。' }),
-          createElement('div', { className: 'poe2-help-line', textContent: '任意一组达标，判断步骤就成立。' }),
+          createElement('div', { className: 'poe2-help-line', textContent: '单条件判断：组之间是“或”，任意一组达标后走统一的成立出口。' }),
+          createElement('div', { className: 'poe2-help-line', textContent: '多条件判断：严格从上到下逐组判断，首个命中组决定“命中后”步骤。' }),
+          createElement('div', { className: 'poe2-help-line', textContent: '首个条件组命中后立即停止判断，后面的条件组不会再执行或覆盖结果。' }),
           createElement('div', { className: 'poe2-help-line', textContent: '每组有自己的“本组命中数”。' }),
           createElement('div', { className: 'poe2-help-line', textContent: '例：3 条条件，命中数填 2，表示任意 2 条满足即可。' }),
           createElement('div', { className: 'poe2-help-title', textContent: '条件类型' }),
@@ -26929,7 +26943,7 @@
           createElement('div', { className: 'poe2-help-line', textContent: '工艺词缀会自动加入可选词缀类型。' }),
           createElement('div', { className: 'poe2-help-line', textContent: '特殊条件：判断稀有度、词缀数量、腐化等状态。' }),
           createElement('div', { className: 'poe2-help-line', textContent: 'Roll 条件：判断数值是否够高。' }),
-          createElement('div', { className: 'poe2-help-line', textContent: '只有“条件判断”步骤会读取条件组。' }),
+          createElement('div', { className: 'poe2-help-line', textContent: '只有“单条件判断”和“多条件判断”步骤会读取条件组。' }),
           createElement('div', { className: 'poe2-help-title', textContent: '例子' }),
           createElement('div', { className: 'poe2-help-line', textContent: '目标：命中 A，或同时命中 B+C。' }),
           createElement('div', { className: 'poe2-help-line', textContent: '组 1 放 A，命中数 1。' }),
@@ -27062,12 +27076,8 @@
       .poe2-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
       .poe2-continuous-editor-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;align-items:start}
       .poe2-continuous-column{display:flex;flex-direction:column;gap:8px;min-width:0}
+      .poe2-routing-hint{display:flex;align-items:center;cursor:default}
       .poe2-craft-common-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
-      .poe2-craft-advanced-filter{grid-column:1 / -1;border:1px solid #d6dbe3;border-radius:6px;background:#f9fafb;overflow:hidden}
-      .poe2-craft-advanced-filter-header{display:flex;align-items:center;gap:6px;padding:8px 10px;font-weight:700;color:#111827;border-bottom:1px solid #d6dbe3}
-      .poe2-craft-advanced-filter-body{padding:10px;grid-template-columns:repeat(3,minmax(0,1fr))}
-      .poe2-craft-advanced-filter-detail-field{grid-column:1 / -1}
-      .poe2-craft-advanced-filter-body>.poe2-affix-group-list{grid-column:1 / -1}
       .poe2-system-grid,.poe2-safety-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
       .poe2-system-grid .poe2-field span,.poe2-safety-grid .poe2-field span{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .poe2-socket-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
@@ -27123,6 +27133,16 @@
       }
       select.poe2-input[multiple]{height:min(96px,calc(100dvh - 32px));max-height:calc(100dvh - 32px);overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;white-space:nowrap;-webkit-overflow-scrolling:touch}
       select.poe2-input[multiple] option{white-space:nowrap}
+      .poe2-affix-tier-field select.poe2-input[multiple]{overflow-x:hidden;white-space:pre-wrap;font-family:Consolas,"Microsoft YaHei UI",monospace}
+      .poe2-affix-tier-field select.poe2-input[multiple] option{box-sizing:border-box;max-width:100%;height:auto;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;line-height:1.4}
+      .poe2-affix-tier-multiselect{box-sizing:border-box;width:100%;min-width:0;height:min(128px,calc(100dvh - 32px));max-height:calc(100dvh - 32px);overflow-y:auto;overflow-x:hidden;border:1px solid var(--poe2-border-strong);border-radius:5px;background:var(--poe2-surface);scrollbar-gutter:stable}
+      .poe2-affix-tier-options{display:grid;min-width:0}
+      .poe2-affix-tier-option{display:block;box-sizing:border-box;min-width:0;padding:4px 7px;color:var(--poe2-text);cursor:pointer;outline:none;user-select:none}
+      .poe2-affix-tier-option:hover{background:rgba(49,95,186,.22)}
+      .poe2-affix-tier-option.selected{background:#315fba;color:#fff}
+      .poe2-affix-tier-option:focus-visible{box-shadow:inset 0 0 0 1px #76a7ff}
+      .poe2-affix-tier-option span{min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;font-family:Consolas,"Microsoft YaHei UI",monospace;font-size:12px;line-height:1.4}
+      .poe2-affix-tier-placeholder{padding:7px;color:var(--poe2-muted);font-size:12px}
       .poe2-stone-select{height:240px!important}
       .poe2-summary{font-size:12px;color:#4b5563;margin:8px 0 0}
       .poe2-battle-summary{padding:8px;border:1px solid #d6dbe3;border-radius:6px;background:#f9fafb;line-height:1.5;word-break:break-word}
@@ -27275,6 +27295,7 @@
         .poe2-textarea{height:82px}
         .poe2-share-code{height:96px}
         select.poe2-input[multiple],.poe2-stone-select{height:min(190px,calc(100dvh - 24px))!important;max-height:calc(100dvh - 24px)}
+        .poe2-affix-tier-multiselect{height:min(190px,calc(100dvh - 24px));max-height:calc(100dvh - 24px)}
         .poe2-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%}
         .poe2-actions .poe2-button{width:100%;min-height:36px;padding:0 8px;white-space:normal;line-height:1.2}
         .poe2-utility-actions{display:flex;width:auto}
@@ -27328,6 +27349,9 @@
       .poe2-theme-light .poe2-section-title,.poe2-theme-dark .poe2-section-title,.poe2-theme-light .poe2-affix-group-head strong,.poe2-theme-dark .poe2-affix-group-head strong{color:var(--poe2-text)}
       .poe2-theme-light .poe2-modal-header .poe2-modal-title,.poe2-theme-dark .poe2-modal-header .poe2-modal-title{color:var(--poe2-header-text)}
       .poe2-theme-light .poe2-field span,.poe2-theme-dark .poe2-field span,.poe2-theme-light .poe2-summary,.poe2-theme-dark .poe2-summary,.poe2-theme-light .poe2-empty,.poe2-theme-dark .poe2-empty,.poe2-theme-light .poe2-muted,.poe2-theme-dark .poe2-muted,.poe2-theme-light .poe2-fractured-meta,.poe2-theme-dark .poe2-fractured-meta,.poe2-theme-light .poe2-affix-empty,.poe2-theme-dark .poe2-affix-empty,.poe2-theme-light .poe2-affix-min-field,.poe2-theme-dark .poe2-affix-min-field{color:var(--poe2-muted)}
+      .poe2-theme-light .poe2-field .poe2-affix-tier-option:not(.selected) span{color:#05070b}
+      .poe2-theme-dark .poe2-field .poe2-affix-tier-option:not(.selected) span{color:#f8fafc}
+      .poe2-theme-light .poe2-field .poe2-affix-tier-option.selected span,.poe2-theme-dark .poe2-field .poe2-affix-tier-option.selected span{color:#fff}
       .poe2-theme-light .poe2-input,.poe2-theme-dark .poe2-input{background:var(--poe2-surface);color:var(--poe2-text);border-color:var(--poe2-border-strong)}
       .poe2-theme-light .poe2-range,.poe2-theme-dark .poe2-range{accent-color:var(--poe2-primary)}
       .poe2-theme-light .poe2-range-value,.poe2-theme-dark .poe2-range-value{color:var(--poe2-text)}
@@ -27344,8 +27368,7 @@
       .poe2-theme-light .poe2-battle-summary,.poe2-theme-dark .poe2-battle-summary,.poe2-theme-light .poe2-rank-output,.poe2-theme-dark .poe2-rank-output{background:var(--poe2-surface-soft);border-color:var(--poe2-border);color:var(--poe2-text-soft)}
       .poe2-theme-light .poe2-skill-tree-jewel-affixes,.poe2-theme-dark .poe2-skill-tree-jewel-affixes{color:var(--poe2-muted)}
       .poe2-theme-light .poe2-rank-output a,.poe2-theme-dark .poe2-rank-output a{color:var(--poe2-accent)}
-      .poe2-theme-light .poe2-unique-card,.poe2-theme-dark .poe2-unique-card,.poe2-theme-light .poe2-unique-craft-card,.poe2-theme-dark .poe2-unique-craft-card,.poe2-theme-light .poe2-craft-advanced-filter,.poe2-theme-dark .poe2-craft-advanced-filter{background:var(--poe2-surface-soft);border-color:var(--poe2-border)}
-      .poe2-theme-light .poe2-craft-advanced-filter-header,.poe2-theme-dark .poe2-craft-advanced-filter-header{color:var(--poe2-text);border-bottom-color:var(--poe2-border)}
+      .poe2-theme-light .poe2-unique-card,.poe2-theme-dark .poe2-unique-card,.poe2-theme-light .poe2-unique-craft-card,.poe2-theme-dark .poe2-unique-craft-card{background:var(--poe2-surface-soft);border-color:var(--poe2-border)}
       .poe2-theme-light .poe2-unique-card>summary strong,.poe2-theme-dark .poe2-unique-card>summary strong,.poe2-theme-light .poe2-unique-craft-card>summary strong,.poe2-theme-dark .poe2-unique-craft-card>summary strong{color:#f97316}
       .poe2-theme-light .poe2-unique-base,.poe2-theme-dark .poe2-unique-base,.poe2-theme-light .poe2-unique-mod small,.poe2-theme-dark .poe2-unique-mod small,.poe2-theme-light .poe2-unique-craft-note,.poe2-theme-dark .poe2-unique-craft-note,.poe2-theme-light .poe2-unique-craft-disabled,.poe2-theme-dark .poe2-unique-craft-disabled,.poe2-theme-light .poe2-unique-craft-empty,.poe2-theme-dark .poe2-unique-craft-empty,.poe2-theme-light .poe2-unique-craft-step-summary,.poe2-theme-dark .poe2-unique-craft-step-summary{color:var(--poe2-muted)}
       .poe2-theme-light .poe2-unique-craft-body,.poe2-theme-dark .poe2-unique-craft-body{border-top-color:var(--poe2-border)}
@@ -27684,153 +27707,6 @@
     });
     refreshCraftPlanSelect();
 
-    state.ui.craftAdvancedFilterEquipmentSelect = createSelect([], '');
-    state.ui.craftAdvancedFilterCorruptedSelect = createSelect([
-      { value: 'any', label: '不限' },
-      { value: 'yes', label: '仅腐化' },
-      { value: 'no', label: '仅未腐化' },
-    ], 'any');
-    state.ui.craftAdvancedFilterCorruptedBaseSelect = createSelect([
-      { value: 'any', label: '不限' },
-      { value: 'yes', label: '任意腐化基底' },
-      { value: 'specific', label: '指定腐化基底' },
-      { value: 'no', label: '无腐化基底' },
-    ], 'any');
-    state.ui.craftAdvancedFilterAffixMatchSelect = createSelect([
-      { value: 'include', label: '需要命中条件组' },
-      { value: 'exclude', label: '排除命中条件组' },
-      { value: 'any', label: '忽略词缀条件' },
-    ], 'include');
-    state.ui.craftAdvancedFilterPositionSelect = createSelect([], '');
-    state.ui.craftAdvancedFilterAffixTypeSelect = createSelect([], '');
-    state.ui.craftAdvancedFilterAffixTierSelect = createSelect([], '');
-    state.ui.craftAdvancedFilterAffixTierSelect.multiple = true;
-    state.ui.craftAdvancedFilterAffixTierSelect.size = 5;
-    state.ui.craftAdvancedFilterDetailLabel = createElement('span', { textContent: '具体词缀' });
-    state.ui.craftAdvancedFilterDetailField = createLabeledControl(
-      state.ui.craftAdvancedFilterDetailLabel,
-      state.ui.craftAdvancedFilterAffixTierSelect,
-      'poe2-craft-advanced-filter-detail-field',
-    );
-    state.ui.craftAdvancedFilterGroupSelect = createSelect([], '');
-    state.ui.craftAdvancedFilterGroupList = createElement('div', { className: 'poe2-affix-group-list' });
-    state.ui.craftAdvancedFilterSummary = createElement('div', {
-      className: 'poe2-summary poe2-wide',
-      textContent: '尚未锁定结果；未扫描时仍按上方基础筛选实时取件。',
-    });
-    setSelectOptions(state.ui.craftAdvancedFilterEquipmentSelect, getAffixEquipmentOptions(), '不限装备类型');
-    setSelectOptions(state.ui.craftAdvancedFilterPositionSelect, [], '选择词缀位置');
-    setSelectOptions(state.ui.craftAdvancedFilterAffixTypeSelect, [], '选择词缀类型');
-    setSelectOptions(state.ui.craftAdvancedFilterAffixTierSelect, [], '选择详细词缀');
-    state.craftAdvancedFilterConditionGroups = [createEmptyAffixConditionGroup()];
-    state.ui.craftAdvancedFilterEquipmentSelect.addEventListener('change', () => {
-      refreshCraftAdvancedFilterPositionSelect();
-      invalidateCraftLockedEquipmentResults();
-    });
-    state.ui.craftAdvancedFilterCorruptedSelect.addEventListener('change', () => invalidateCraftLockedEquipmentResults());
-    state.ui.craftAdvancedFilterCorruptedBaseSelect.addEventListener('change', () => {
-      refreshCraftAdvancedFilterDetailSelect();
-      invalidateCraftLockedEquipmentResults();
-    });
-    state.ui.craftAdvancedFilterAffixMatchSelect.addEventListener('change', () => invalidateCraftLockedEquipmentResults());
-    state.ui.craftAdvancedFilterPositionSelect.addEventListener('change', refreshCraftAdvancedFilterAffixTypeSelect);
-    state.ui.craftAdvancedFilterAffixTypeSelect.addEventListener('pointerdown', switchCraftAdvancedFilterToAffixDetail);
-    state.ui.craftAdvancedFilterAffixTypeSelect.addEventListener('change', () => {
-      if (!switchCraftAdvancedFilterToAffixDetail()) refreshCraftAdvancedFilterAffixTierSelect();
-    });
-    state.ui.craftAdvancedFilterAffixTierSelect.addEventListener('change', () => {
-      if (state.ui.craftAdvancedFilterCorruptedBaseSelect.value === 'specific') {
-        invalidateCraftLockedEquipmentResults();
-      }
-    });
-    state.ui.craftAdvancedFilterAffixTierSelect.addEventListener('dblclick', () => {
-      addCraftAdvancedFilterAffixConditions(Array.from(state.ui.craftAdvancedFilterAffixTierSelect.selectedOptions || []));
-    });
-    state.ui.craftAdvancedFilterScanButton = createButton(
-      '扫描并锁定结果',
-      () => runTask('扫描并锁定结果', scanAndLockCraftAdvancedFilterResults),
-    );
-    state.ui.craftAdvancedFilterAddConditionButton = createButton('添加条件', () => {
-      addCraftAdvancedFilterAffixConditions(Array.from(state.ui.craftAdvancedFilterAffixTierSelect.selectedOptions || []));
-    });
-    const addCraftAdvancedFilterGroupButton = createButton('添加条件组', () => {
-      state.craftAdvancedFilterConditionGroups.push(createEmptyAffixConditionGroup());
-      state.ui.craftAdvancedFilterGroupSelect.value = String(state.craftAdvancedFilterConditionGroups.length - 1);
-      invalidateCraftLockedEquipmentResults();
-      renderCraftAdvancedFilterConditionBuilder();
-    });
-    const clearCraftAdvancedFilterConditionsButton = createButton('清空条件', () => {
-      state.craftAdvancedFilterConditionGroups = [createEmptyAffixConditionGroup()];
-      invalidateCraftLockedEquipmentResults();
-      renderCraftAdvancedFilterConditionBuilder();
-    });
-    const clearCraftAdvancedFilterLockButton = createButton('解除锁定', () => {
-      invalidateCraftLockedEquipmentResults('已解除高级筛选锁定，将恢复按公共基础筛选实时取件。');
-    });
-    renderCraftAdvancedFilterConditionBuilder();
-    [state.ui.keywordInput, state.ui.targetCountInput].forEach((controlElement) => {
-      controlElement.addEventListener('input', () => invalidateCraftLockedEquipmentResults());
-    });
-    state.ui.raritySelect.addEventListener('change', () => invalidateCraftLockedEquipmentResults());
-    state.ui.storageSelect.addEventListener('change', () => invalidateCraftLockedEquipmentResults());
-    const craftAdvancedFilterHelp = createHelpTooltip('高级筛选说明', [
-      '上方关键词、稀有度、目标数量和读取位置也会参与扫描。',
-      '词缀条件组之间为“或”；组内按“本组命中数”判断。',
-      '腐化基底选“指定腐化基底”时，第三行会改为可用腐化词缀，并按 Magic ID 精确筛选。',
-      '普通模式下依次选择装备类型、词缀位置和词缀类型，第三行选择具体词缀后再添加到条件组。',
-      '点击“扫描并锁定结果”后，公共打造只会处理锁定的装备 ID。',
-      '经典打造、自定义打造、批量通货、连续批量和暗金打造共用该锁定。',
-      '修改任一基础或高级条件都会自动解除旧锁定，需要重新扫描。',
-      '锁定结果为零时不会回退到背包或储藏继续取件。',
-      '不需要锁定时点击“解除锁定”，恢复按基础筛选实时取件。',
-    ]);
-    craftAdvancedFilterHelp.addEventListener('click', (event) => {
-      event.stopPropagation();
-    });
-    state.ui.craftAdvancedFilterSection = createElement('div', {
-      className: 'poe2-craft-advanced-filter poe2-wide',
-      children: [
-        createElement('div', {
-          className: 'poe2-craft-advanced-filter-header poe2-title-with-help',
-          children: [
-            createElement('span', { textContent: '高级筛选' }),
-            craftAdvancedFilterHelp,
-          ],
-        }),
-        createElement('div', {
-          className: 'poe2-grid poe2-craft-advanced-filter-body',
-          children: [
-            createLabeledControl('腐化', state.ui.craftAdvancedFilterCorruptedSelect),
-            createLabeledControl('腐化基底', state.ui.craftAdvancedFilterCorruptedBaseSelect),
-            createLabeledControl('词缀条件', state.ui.craftAdvancedFilterAffixMatchSelect),
-            createLabeledControl('装备类型', state.ui.craftAdvancedFilterEquipmentSelect),
-            createLabeledControl('词缀位置', state.ui.craftAdvancedFilterPositionSelect),
-            createLabeledControl('词缀类型', state.ui.craftAdvancedFilterAffixTypeSelect),
-            state.ui.craftAdvancedFilterDetailField,
-            createLabeledControl('当前条件组', state.ui.craftAdvancedFilterGroupSelect),
-            createElement('div', {
-              className: 'poe2-actions poe2-wide',
-              children: [
-                state.ui.craftAdvancedFilterAddConditionButton,
-                addCraftAdvancedFilterGroupButton,
-                clearCraftAdvancedFilterConditionsButton,
-              ],
-            }),
-            state.ui.craftAdvancedFilterGroupList,
-            createElement('div', {
-              className: 'poe2-actions poe2-wide',
-              children: [
-                state.ui.craftAdvancedFilterScanButton,
-                clearCraftAdvancedFilterLockButton,
-              ],
-            }),
-            state.ui.craftAdvancedFilterSummary,
-          ],
-        }),
-      ],
-    });
-    state.ui.craftAdvancedFilterSection.hidden = true;
-
     const commonSection = createElement('div', {
       className: 'poe2-section poe2-grid poe2-craft-common-grid',
       children: [
@@ -27994,10 +27870,10 @@
       label: option.label,
     })), CRAFT_BENCH_CATEGORY_OPTIONS[0].value);
     state.ui.continuousCraftIdSelect = createSelect([], '');
-    state.ui.continuousGardenCategorySelect = createSelect(GARDEN_CRAFT_CATEGORY_OPTIONS.map((option) => ({
+    state.ui.continuousGardenCategorySelect = createSelect(CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS.map((option) => ({
       value: option.value,
       label: option.label,
-    })), GARDEN_CRAFT_CATEGORY_OPTIONS[0].value);
+    })), CUSTOM_GARDEN_CRAFT_CATEGORY_OPTIONS[0].value);
     state.ui.continuousGardenCraftSelect = createSelect([], '');
     state.ui.continuousSuccessSelect = createSelect(Object.entries(CONTINUOUS_STEP_HANDLINGS).map(([value, handlingConfig]) => ({
       value,
@@ -28032,6 +27908,7 @@
       } else if (['gardenCraft', 'catalyst'].includes(getActionFromContinuousActionControls())) {
         scheduleContinuousGardenCraftOptionsRefresh(false);
       }
+      renderAffixConditionBuilder();
       renderContinuousCraftSteps();
     });
     state.ui.continuousActionSelect.addEventListener('change', () => {
@@ -28043,6 +27920,7 @@
       } else if (['gardenCraft', 'catalyst'].includes(getActionFromContinuousActionControls())) {
         scheduleContinuousGardenCraftOptionsRefresh(false);
       }
+      renderAffixConditionBuilder();
       renderContinuousCraftSteps();
     });
     state.ui.continuousCraftCategorySelect.addEventListener('change', () => {
@@ -28193,6 +28071,7 @@
         startUniqueButton,
         createHelpTooltip('自动暗金说明', [
           '把目标装备准备为普通后，循环机会石和重铸石，直到变为暗金。',
+          '带有锁定词缀的破裂装备会自动跳过，不会使用任何通货。',
           '达到经典动作上限会立刻停止整次任务。',
         ]),
         state.ui.stopButtons.classic,
@@ -28217,13 +28096,15 @@
                   '智能操作：只在需要时消耗。',
                   '智能工艺：已有相同工艺会跳过。',
                   '有多大师且对应位置有空位时，会尝试工艺。',
-                  '条件判断：只判断，不消耗。',
+                  '单条件判断：多个条件组之间为“或”，命中任意一组后走统一的成立出口。',
+                  '多条件判断：按条件组从上到下判断，首个命中组进入该组指定的下一步。',
+                  '多条件判断全部不命中时，执行“条件不成立”处理。',
                   '无动作：不改装备，只继续流程。',
                 ]), state.ui.continuousActionKindSelect),
                 createLabeledControl('动作明细', state.ui.continuousActionSelect),
                 state.ui.continuousCraftCategoryField = createLabeledControl('工艺部位', state.ui.continuousCraftCategorySelect),
                 state.ui.continuousCraftIdField = createLabeledControl('工艺词缀', state.ui.continuousCraftIdSelect),
-                state.ui.continuousGardenCategoryField = createLabeledControl('花园类型', state.ui.continuousGardenCategorySelect),
+                state.ui.continuousGardenCategoryField = createLabeledControl('花园分类', state.ui.continuousGardenCategorySelect),
                 state.ui.continuousGardenCraftField = createLabeledControl('工艺方法', state.ui.continuousGardenCraftSelect),
               ],
             }),
@@ -28231,6 +28112,14 @@
               className: 'poe2-continuous-column',
               children: [
                 createElement('div', { className: 'poe2-section-title', textContent: '成功' }),
+                state.ui.continuousMultiConditionSuccessField = createLabeledControl(
+                  '条件成立',
+                  createElement('div', {
+                    className: 'poe2-input poe2-routing-hint',
+                    textContent: '按条件组命中后',
+                    title: '多条件判断按从上到下第一个命中的条件组，进入该组设置的“命中后”步骤。',
+                  }),
+                ),
                 state.ui.continuousSuccessHandlingField = createLabeledControl(createHelpedLabel('条件成立', '条件成立处理说明', [
                   '条件步骤：表示成立后的处理。',
                   '普通动作：表示完成后的处理。',
@@ -28250,7 +28139,7 @@
               children: [
                 createElement('div', { className: 'poe2-section-title', textContent: '失败' }),
                 state.ui.continuousFailureHandlingField = createLabeledControl(createHelpedLabel('条件不成立', '条件不成立处理说明', [
-                  '只对“条件判断”步骤生效。',
+                  '只对“单条件判断”和“多条件判断”步骤生效。',
                   '跳转：进入指定步骤。',
                   '重铸后从 A 开始：先重铸一次。',
                   '破裂装备重铸停在魔法也会继续。',
@@ -28283,6 +28172,7 @@
         }),
       ],
     });
+    state.ui.continuousMultiConditionSuccessField.hidden = true;
     updateContinuousCraftBenchControlsVisibility();
     const batchSection = createElement('div', {
       className: 'poe2-section poe2-grid',
@@ -28353,6 +28243,7 @@
             startUniqueCraftButton,
             createHelpTooltip('暗金打造说明', [
               '按步骤依次打造目标基底。',
+              '带有锁定词缀的破裂装备会自动排除，起始通货和暗金后处理都不会作用于它。',
               '命中暗金后，按对应暗金卡片里的配置处理。',
               '可配置孔洞、品质、花园工艺、催化剂、Roll、瓦尔和最终去向。',
               '花园工艺与催化剂按每件暗金的实际装备类型分别显示。',
@@ -28583,10 +28474,6 @@
       state.ui.equipmentFilterPositionSelect,
       state.ui.equipmentFilterAffixTypeSelect,
       state.ui.equipmentFilterAffixTierSelect,
-      state.ui.craftAdvancedFilterEquipmentSelect,
-      state.ui.craftAdvancedFilterPositionSelect,
-      state.ui.craftAdvancedFilterAffixTypeSelect,
-      state.ui.craftAdvancedFilterAffixTierSelect,
     ].filter(Boolean);
     pickerControls.forEach((control) => { control.disabled = true; });
     try {
@@ -28596,9 +28483,6 @@
       }
       if (state.ui.equipmentFilterEquipmentSelect?.value && state.ui.equipmentFilterPositionSelect?.value) {
         refreshEquipmentFilterAffixTypeSelect();
-      }
-      if (state.ui.craftAdvancedFilterEquipmentSelect?.value && state.ui.craftAdvancedFilterPositionSelect?.value) {
-        refreshCraftAdvancedFilterAffixTypeSelect();
       }
       const appendedCount = Object.values(state.craftBench.affixPickerByEquipment || {})
         .flatMap((positionData) => Object.values(positionData || {}))
